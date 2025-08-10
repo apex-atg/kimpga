@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>김프 자동매매 시스템</title>
+  <style>
+    body { margin: 0; font-family: 'Segoe UI', sans-serif; background-color: #121212; color: #e0e0e0; }
+    header { background-color: #1f1f1f; padding: 1em 2em; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }
+    h1 { margin: 0; font-size: 1.5em; }
+    .container { padding: 2em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2em; }
+    .card { background-color: #1e1e1e; padding: 1.5em; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
+    label { display: block; margin-bottom: 0.5em; }
+    input[type="number"] { width: 100%; padding: 0.5em; background-color: #2a2a2a; border: 1px solid #444; color: #fff; border-radius: 5px; }
+    button { margin-top: 0.75em; padding: 0.7em 1.5em; background-color: #03dac6; color: #000; border: none; border-radius: 5px; cursor: pointer; }
+    button[disabled] { opacity: 0.6; cursor: not-allowed; }
+    pre { background-color: #000; color: #0f0; padding: 1em; border-radius: 10px; white-space: pre-wrap; max-height: 420px; overflow-y: auto; font-size: 0.9em; }
+    .highlight { color: #03dac6; font-weight: bold; }
+    .muted { color: #9aa0a6; font-size: 0.9em; }
+    .row { display: flex; gap: 0.75em; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>김치프리미엄 자동매매</h1>
+    <div id="kimp-info" class="muted">-</div>
+  </header>
+
+  <div class="container">
+    <div class="grid">
+      <!-- 전략 설정 -->
+      <div class="card">
+        <h3>전략 설정</h3>
+        <label>목표 김프 <input type="number" id="target_kimp" value="0.8" step="0.01"></label>
+        <label>청산 김프 <input type="number" id="exit_kimp" value="1.0" step="0.01"></label>
+        <label>오차 허용 <input type="number" id="tolerance" value="0.1" step="0.01"></label>
+        <label>진입 금액 (KRW) <input type="number" id="amount_krw" value="1000000" step="1000"></label>
+        <label>레버리지 <input type="number" id="leverage" value="3" step="1"></label>
+        <div class="row">
+          <button id="btn-start" onclick="startStrategy()">▶ 전략 시작</button>
+          <button id="btn-stop" onclick="stopStrategy()">■ 전략 중지</button>
+        </div>
+      </div>
+
+      <!-- 현재 상태 -->
+      <div class="card">
+        <h3>현재 상태</h3>
+        <p>김프: <span id="kimp" class="highlight">-</span>%</p>
+        <p>업비트: <span id="upbit_price" class="highlight">-</span> KRW</p>
+        <p>바이낸스: <span id="binance_price" class="highlight">-</span> USDT</p>
+        <p>환율: <span id="usdkrw" class="highlight">-</span></p>
+        <hr/>
+        <p>상태: <span id="status">-</span></p>
+        <p>포지션: <span id="position">-</span></p>
+        <p>총 거래 횟수: <span id="count">0</span></p>
+        <p>수익률: <span id="pnl" class="highlight">0</span>% / <span id="krw" class="highlight">0</span> KRW</p>
+      </div>
+
+      <!-- 실제 잔고 -->
+      <div class="card">
+        <h3>실제 잔고</h3>
+        <p>KRW: <span id="real_krw">-</span></p>
+        <p>BTC: <span id="real_btc">-</span></p>
+        <p>USDT: <span id="real_usdt">-</span></p>
+        <hr/>
+        <p>업비트 진입 수량: <span id="entry_upbit_qty">0.000</span></p>
+        <p>바이낸스 진입 수량: <span id="entry_binance_qty">0.000</span></p>
+      </div>
+    </div>
+
+    <!-- 거래 로그 -->
+    <div class="card" style="margin-top: 2em;">
+      <h3>거래 로그</h3>
+      <pre id="log">Loading...</pre>
+    </div>
+  </div>
+
+  <script>
+    // --- 안전한 숫자 표시 유틸 ---
+    const isNum = v => typeof v === 'number' && isFinite(v);
+    const safeFixed = (v, n=2) => isNum(v) ? Number(v).toFixed(n) : '-';
+    const safeLocale = v => isNum(v) ? Number(v).toLocaleString() : '-';
+
+    let lastLogCount = 0;
+
+    function setButtons(running) {
+      const btnStart = document.getElementById('btn-start');
+      const btnStop  = document.getElementById('btn-stop');
+      btnStart.disabled = !!running;
+      btnStop.disabled  = !running;
+    }
+
+    async function refresh() {
+      try {
+        // 1) 현재 김프/가격/환율
+        const k = await fetch('/current_kimp').then(res => res.json());
+        document.getElementById('kimp').innerText = safeFixed(k.kimp, 2);
+        document.getElementById('upbit_price').innerText = safeLocale(k.upbit_price);
+        document.getElementById('binance_price').innerText = safeFixed(k.binance_price, 2);
+        document.getElementById('usdkrw').innerText = safeFixed(k.usdkrw, 2);
+
+        // 헤더 요약
+        document.getElementById('kimp-info').innerText =
+          `김프 ${safeFixed(k.kimp,2)}% | 업비트 ${safeLocale(k.upbit_price)} KRW | 바이낸스 ${safeFixed(k.binance_price,2)} USDT | 환율 ${safeFixed(k.usdkrw,2)}`;
+
+        // 2) 상태
+        const s = await fetch('/status').then(res => res.json());
+        document.getElementById('status').innerText = s.running ? '실행중' : '중지됨';
+        document.getElementById('position').innerText = s.position_state ?? '-';
+        document.getElementById('count').innerText = s.trade_count ?? 0;
+        document.getElementById('pnl').innerText = isNum(s.total_pnl) ? s.total_pnl : 0;
+        document.getElementById('krw').innerText = isNum(s.profit_krw) ? safeLocale(s.profit_krw) : 0;
+
+        // 진입 수량 표시 (소수점 3자리 고정)
+        const upQty = (s.entry_info && isNum(s.entry_info.upbit_qty)) ? s.entry_info.upbit_qty : 0;
+        const biQty = (s.entry_info && isNum(s.entry_info.binance_qty)) ? s.entry_info.binance_qty : 0;
+        document.getElementById('entry_upbit_qty').innerText = Number(upQty).toFixed(3);
+        document.getElementById('entry_binance_qty').innerText = Number(biQty).toFixed(3);
+
+        // 로그 갱신 + 자동 스크롤
+        if (Array.isArray(s.logs) && s.logs.length !== lastLogCount) {
+          const logEl = document.getElementById('log');
+          logEl.innerText = s.logs.join('\n');
+          lastLogCount = s.logs.length;
+          logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // 3) 실제 잔고
+        const b = await fetch('/balance').then(res => res.json());
+        document.getElementById('real_krw').innerText = safeLocale(b?.real?.krw ?? 0);
+        document.getElementById('real_btc').innerText = safeFixed(b?.real?.btc_upbit ?? 0, 6);
+        document.getElementById('real_usdt').innerText = safeFixed(b?.real?.usdt ?? 0, 3);
+
+        // 버튼 상태 동기화
+        setButtons(s.running);
+
+      } catch (err) {
+        console.error('데이터 갱신 오류:', err);
+      }
+    }
+
+    async function startStrategy() {
+      const config = {
+        target_kimp: parseFloat(document.getElementById('target_kimp').value),
+        exit_kimp: parseFloat(document.getElementById('exit_kimp').value),
+        tolerance: parseFloat(document.getElementById('tolerance').value),
+        amount_krw: parseFloat(document.getElementById('amount_krw').value),
+        leverage: parseFloat(document.getElementById('leverage').value),
+      };
+      try {
+        await fetch('/start', {
+          method : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body   : JSON.stringify(config),
+        });
+        setButtons(true);
+        alert('전략이 시작되었습니다.');
+      } catch (e) {
+        alert('전략 시작 중 오류가 발생했습니다.');
+      }
+    }
+
+    async function stopStrategy() {
+      try {
+        await fetch('/stop', { method: 'POST' });
+        setButtons(false);
+        alert('전략이 중지되었습니다.');
+      } catch (e) {
+        alert('전략 중지 중 오류가 발생했습니다.');
+      }
+    }
+
+    // 초기화
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
