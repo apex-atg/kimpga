@@ -19,6 +19,7 @@
     .highlight { color: #03dac6; font-weight: bold; }
     .muted { color: #9aa0a6; font-size: 0.9em; }
     .row { display: flex; gap: 0.75em; flex-wrap: wrap; }
+    .small { font-size: 0.9em; color: #bdbdbd; }
   </style>
 </head>
 <body>
@@ -41,6 +42,7 @@
           <button id="btn-start" onclick="startStrategy()">▶ 전략 시작</button>
           <button id="btn-stop" onclick="stopStrategy()">■ 전략 중지</button>
         </div>
+        <p class="small">※ 격리 모드 x 레버리지 적용. 바이낸스 포지션 <b>사이즈=금액/환율</b>, <b>증거금=사이즈/레버리지</b>로 자동 계산됩니다.</p>
       </div>
 
       <!-- 현재 상태 -->
@@ -55,6 +57,10 @@
         <p>포지션: <span id="position">-</span></p>
         <p>총 거래 횟수: <span id="count">0</span></p>
         <p>수익률: <span id="pnl" class="highlight">0</span>% / <span id="krw" class="highlight">0</span> KRW</p>
+        <hr/>
+        <!-- 추가: 계산된 목표 사이즈/증거금 미리보기 -->
+        <p>바이낸스 <b>목표 사이즈</b>: <span id="target_size_usdt" class="highlight">-</span> USDT</p>
+        <p>필요 <b>증거금</b> (격리): <span id="required_margin" class="highlight">-</span> USDT</p>
       </div>
 
       <!-- 실제 잔고 -->
@@ -91,6 +97,20 @@
       btnStop.disabled  = !running;
     }
 
+    function computeSizePreview(usdkrw) {
+      const amountKrw = parseFloat(document.getElementById('amount_krw').value) || 0;
+      const lev       = parseFloat(document.getElementById('leverage').value) || 1;
+      if (!usdkrw || usdkrw <= 0 || amountKrw <= 0 || lev <= 0) {
+        document.getElementById('target_size_usdt').innerText = '-';
+        document.getElementById('required_margin').innerText  = '-';
+        return;
+      }
+      const targetSize = amountKrw / usdkrw;      // 사이즈(USDT)
+      const marginNeed = targetSize / lev;        // 증거금(USDT)
+      document.getElementById('target_size_usdt').innerText = safeFixed(targetSize, 2);
+      document.getElementById('required_margin').innerText  = safeFixed(marginNeed, 2);
+    }
+
     async function refresh() {
       try {
         // 1) 현재 김프/가격/환율
@@ -103,6 +123,9 @@
         // 헤더 요약
         document.getElementById('kimp-info').innerText =
           `김프 ${safeFixed(k.kimp,2)}% | 업비트 ${safeLocale(k.upbit_price)} KRW | 바이낸스 ${safeFixed(k.binance_price,2)} USDT | 환율 ${safeFixed(k.usdkrw,2)}`;
+
+        // 사이즈/증거금 미리보기 계산
+        computeSizePreview(k.usdkrw);
 
         // 2) 상태
         const s = await fetch('/status').then(res => res.json());
