@@ -1,202 +1,651 @@
 <!DOCTYPE html>
 <html lang="ko">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>김프 자동매매 시스템</title>
+  <title>김프 자동매매 시스템 · Pro Dashboard</title>
   <style>
-    body { margin: 0; font-family: 'Segoe UI', sans-serif; background-color: #121212; color: #e0e0e0; }
-    header { background-color: #1f1f1f; padding: 1em 2em; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 10; }
-    h1 { margin: 0; font-size: 1.5em; }
-    .container { padding: 2em; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 2em; }
-    .card { background-color: #1e1e1e; padding: 1.5em; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.5); }
-    label { display: block; margin-bottom: 0.5em; }
-    input[type="number"] { width: 100%; padding: 0.5em; background-color: #2a2a2a; border: 1px solid #444; color: #fff; border-radius: 5px; }
-    button { margin-top: 0.75em; padding: 0.7em 1.5em; background-color: #03dac6; color: #000; border: none; border-radius: 5px; cursor: pointer; }
-    button[disabled] { opacity: 0.6; cursor: not-allowed; }
-    pre { background-color: #000; color: #0f0; padding: 1em; border-radius: 10px; white-space: pre-wrap; max-height: 420px; overflow-y: auto; font-size: 0.9em; }
-    .highlight { color: #03dac6; font-weight: bold; }
-    .muted { color: #9aa0a6; font-size: 0.9em; }
-    .row { display: flex; gap: 0.75em; flex-wrap: wrap; }
-    .small { font-size: 0.9em; color: #bdbdbd; }
+    :root{
+      --bg: #0b0f17;
+      --panel:#0f1522;
+      --panel-2:#0c1320;
+      --text:#e7ecf5;
+      --muted:#98a3b7;
+      --primary:#00e0c7;
+      --primary-2:#14b8a6;
+      --accent:#7aa2ff;
+      --accent-2:#60a5fa;
+      --danger:#ff5570;
+      --warn:#ffb020;
+      --ok:#22c55e;
+      --border:#1b2536;
+      --chip:#111a29;
+      --shadow: 0 10px 30px rgba(0,0,0,0.45);
+      --radius:14px;
+      --ring: 0 0 0 3px rgba(122,162,255,.15);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background: radial-gradient(1200px 600px at 80% -20%, rgba(0,224,199,.07), transparent 60%),
+                  radial-gradient(1000px 500px at 10% -10%, rgba(122,162,255,.07), transparent 60%),
+                  linear-gradient(180deg,#0a0e16 0%, var(--bg) 100%);
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Apple SD Gothic Neo', 'Noto Sans KR', 'Noto Sans', sans-serif;
+    }
+    header{
+      position:sticky; top:0; z-index:40;
+      backdrop-filter: blur(10px) saturate(160%);
+      background:rgba(8,12,20,0.65);
+      border-bottom:1px solid var(--border);
+    }
+    .nav{
+      max-width:1220px; margin:0 auto; padding:12px 18px; display:flex; align-items:center; gap:14px;
+    }
+    .brand{display:flex; align-items:center; gap:12px; font-weight:800; letter-spacing:.2px}
+    .logo{
+      width:30px; height:30px; display:inline-grid; place-items:center; border-radius:10px;
+      background:conic-gradient(from 210deg, var(--primary), #6ee7b7, #22d3ee, var(--accent));
+      color:#03121a; font-weight:900;
+      box-shadow: 0 0 0 4px rgba(0,224,199,.08);
+    }
+    .sub{color:var(--muted); font-size:12px}
+    .chip{
+      background:linear-gradient(180deg, #0e1728, #0a1220);
+      color:#cbd5e1; border:1px solid var(--border); padding:6px 10px; border-radius:999px; font-size:12px;
+      display:inline-flex; align-items:center; gap:8px;
+    }
+    .dot{width:7px; height:7px; border-radius:50%; background:#94a3b8; box-shadow:0 0 0 2px rgba(148,163,184,.15)}
+    .dot.ok{background:var(--ok)}
+    .dot.warn{background:var(--warn)}
+    .dot.danger{background:var(--danger)}
+    .grow{flex:1}
+    .kimp-brief{font-size:13px; color:#c9d2e3; font-variant-numeric: tabular-nums}
+
+    .wrap{max-width:1220px; margin:22px auto; padding:0 18px}
+    .grid{display:grid; gap:18px; grid-template-columns: repeat(12, 1fr);}
+    .col-4{grid-column: span 4}
+    .col-8{grid-column: span 8}
+    .col-6{grid-column: span 6}
+    .col-12{grid-column: span 12}
+    @media (max-width: 1024px){
+      .col-4,.col-6,.col-8{grid-column:span 12}
+    }
+
+    .card{
+      background:linear-gradient(180deg,var(--panel) 0%, var(--panel-2) 100%);
+      border:1px solid var(--border); border-radius:var(--radius); box-shadow: var(--shadow);
+      padding:18px;
+    }
+    .card h3{margin:0 0 10px 0; font-size:16px}
+    .row{display:flex; gap:10px; flex-wrap:wrap}
+    label{display:block; font-size:12px; color:var(--muted); margin-bottom:6px}
+    .ctrl{
+      background:#0b1220; border:1px solid #1e293b; color:#dbe6ff; border-radius:10px; width:100%; padding:10px 12px; outline:none;
+      font-variant-numeric: tabular-nums;
+    }
+    .ctrl:focus{border-color:#274674; box-shadow:var(--ring)}
+    .hint{font-size:12px; color:#aab3c7; margin-top:6px}
+    .btn{
+      appearance:none; border:none; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:800;
+      background:linear-gradient(135deg,var(--primary), var(--primary-2)); color:#051018;
+      transition: transform .05s ease, box-shadow .15s ease;
+      box-shadow: 0 6px 18px rgba(0,224,199,0.15);
+    }
+    .btn:hover{box-shadow: 0 8px 24px rgba(0,224,199,0.22)}
+    .btn:active{transform: translateY(1px)}
+    .btn.secondary{background:#122036; color:#e2e8f0; border:1px solid #22324b; box-shadow:none}
+    .btn.ghost{background:transparent; border:1px dashed #334155; color:#a9b4c7; box-shadow:none}
+    .btn:disabled{opacity:.55; cursor:not-allowed}
+    .btn.preset{padding:6px 10px; border-radius:999px; background:#10192b; color:#cbd5e1; border:1px solid #24324a}
+
+    .kv{display:grid; grid-template-columns: 130px 1fr; gap:6px; font-size:14px}
+    .kv b{color:#c9d5ea}
+    .hl{color:var(--primary)}
+    .mono{font-variant-numeric: tabular-nums; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
+
+    .tabs{display:flex; gap:6px; border-bottom:1px solid var(--border); margin-bottom:10px}
+    .tab{padding:8px 12px; border-radius:10px 10px 0 0; cursor:pointer; background:#0d1729; color:#aab3c7; border:1px solid var(--border); border-bottom:none}
+    .tab.active{background:#0a1220; color:#dbe6ff}
+    .panel{display:none}
+    .panel.active{display:block}
+
+    .log{
+      background:#05080f; color:#99f7ae; border:1px solid #1b2a3b; padding:12px; border-radius:10px; height:360px; overflow:auto;
+      font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .muted{color:var(--muted)}
+    .badge{padding:3px 8px; border-radius:999px; font-size:12px; border:1px solid var(--border); background:#0b1320}
+    .badge.good{color:var(--ok); border-color:rgba(34,197,94,.3)}
+    .badge.bad{color:var(--danger); border-color:rgba(255,85,112,.3)}
+    .badge.warn{color:var(--warn); border-color:rgba(255,176,32,.3)}
+
+    /* sparkline */
+    .spark{width:100%; height:54px; display:block; background:#0a1220; border:1px solid #1b2a3b; border-radius:10px}
+    .spark-wrap{display:grid; grid-template-columns:1fr 90px; gap:10px; align-items:center}
+    .spark-val{text-align:right; font-weight:800}
+    .spark-val small{display:block; color:var(--muted); font-weight:600}
+
+    .split{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    @media (max-width: 600px){ .split{grid-template-columns:1fr} }
+
+    /* proximity bar */
+    .bar{height:10px; background:#0c1320; border:1px solid #1d2a40; border-radius:9999px; overflow:hidden}
+    .bar > i{display:block; height:100%; width:0%; background:linear-gradient(90deg, var(--accent), var(--primary)); transition:width .25s ease}
   </style>
 </head>
 <body>
-  <header>
-    <h1>김치프리미엄 자동매매</h1>
-    <div id="kimp-info" class="muted">-</div>
-  </header>
-
-  <div class="container">
-    <div class="grid">
-      <!-- 전략 설정 -->
-      <div class="card">
-        <h3>전략 설정</h3>
-        <label>목표 김프 <input type="number" id="target_kimp" value="0.8" step="0.01"></label>
-        <label>청산 김프 <input type="number" id="exit_kimp" value="1.0" step="0.01"></label>
-        <label>오차 허용 <input type="number" id="tolerance" value="0.1" step="0.01"></label>
-        <label>진입 금액 (KRW) <input type="number" id="amount_krw" value="1000000" step="1000"></label>
-        <label>레버리지 <input type="number" id="leverage" value="3" step="1"></label>
-        <div class="row">
-          <button id="btn-start" onclick="startStrategy()">▶ 전략 시작</button>
-          <button id="btn-stop" onclick="stopStrategy()">■ 전략 중지</button>
-        </div>
-        <p class="small">※ 격리 모드 x 레버리지 적용. 바이낸스 포지션 <b>사이즈=금액/환율</b>, <b>증거금=사이즈/레버리지</b>로 자동 계산됩니다.</p>
-      </div>
-
-      <!-- 현재 상태 -->
-      <div class="card">
-        <h3>현재 상태</h3>
-        <p>김프: <span id="kimp" class="highlight">-</span>%</p>
-        <p>업비트: <span id="upbit_price" class="highlight">-</span> KRW</p>
-        <p>바이낸스: <span id="binance_price" class="highlight">-</span> USDT</p>
-        <p>환율: <span id="usdkrw" class="highlight">-</span></p>
-        <hr/>
-        <p>상태: <span id="status">-</span></p>
-        <p>포지션: <span id="position">-</span></p>
-        <p>총 거래 횟수: <span id="count">0</span></p>
-        <p>수익률: <span id="pnl" class="highlight">0</span>% / <span id="krw" class="highlight">0</span> KRW</p>
-        <hr/>
-        <!-- 추가: 계산된 목표 사이즈/증거금 미리보기 -->
-        <p>바이낸스 <b>목표 사이즈</b>: <span id="target_size_usdt" class="highlight">-</span> USDT</p>
-        <p>필요 <b>증거금</b> (격리): <span id="required_margin" class="highlight">-</span> USDT</p>
-      </div>
-
-      <!-- 실제 잔고 -->
-      <div class="card">
-        <h3>실제 잔고</h3>
-        <p>KRW: <span id="real_krw">-</span></p>
-        <p>BTC: <span id="real_btc">-</span></p>
-        <p>USDT: <span id="real_usdt">-</span></p>
-        <hr/>
-        <p>업비트 진입 수량: <span id="entry_upbit_qty">0.000</span></p>
-        <p>바이낸스 진입 수량: <span id="entry_binance_qty">0.000</span></p>
+<header>
+  <div class="nav">
+    <div class="brand">
+      <div class="logo">₿</div>
+      <div>
+        김치프리미엄 자동매매<br/>
+        <span class="sub">Pro Dashboard · Ultra-Fast Cache</span>
       </div>
     </div>
 
-    <!-- 거래 로그 -->
-    <div class="card" style="margin-top: 2em;">
-      <h3>거래 로그</h3>
-      <pre id="log">Loading...</pre>
-    </div>
+    <span id="run-badge" class="chip"><i class="dot"></i><span>상태 확인중…</span></span>
+    <span id="mode-badge" class="chip"><i class="dot ok"></i>0.25s Price · 20s FX</span>
+
+    <div class="grow"></div>
+    <div id="kimp-brief" class="kimp-brief mono">-</div>
   </div>
+</header>
 
-  <script>
-    // --- 안전한 숫자 표시 유틸 ---
-    const isNum = v => typeof v === 'number' && isFinite(v);
-    const safeFixed = (v, n=2) => isNum(v) ? Number(v).toFixed(n) : '-';
-    const safeLocale = v => isNum(v) ? Number(v).toLocaleString() : '-';
+<div class="wrap">
+  <div class="grid">
+    <!-- 전략 설정 -->
+    <section class="card col-4">
+      <h3>전략 설정</h3>
 
-    let lastLogCount = 0;
+      <div class="row" style="gap:6px; margin-bottom:8px">
+        <button class="btn preset" data-preset="-0.80,-0.50,0.10,1000000,3">프리셋 A (타겟 -0.8 → -0.5)</button>
+        <button class="btn preset" data-preset="-0.70,-0.45,0.10,1000000,3">프리셋 B</button>
+        <button class="btn preset" data-preset="0.80,1.10,0.10,1000000,3">프리셋 C(+)</button>
+      </div>
 
-    function setButtons(running) {
-      const btnStart = document.getElementById('btn-start');
-      const btnStop  = document.getElementById('btn-stop');
-      btnStart.disabled = !!running;
-      btnStop.disabled  = !running;
-    }
+      <div class="split">
+        <div>
+          <label>목표 김프(%)</label>
+          <input class="ctrl" id="target_kimp" type="number" step="0.01" value="0.8">
+        </div>
+        <div>
+          <label>청산 김프(%)</label>
+          <input class="ctrl" id="exit_kimp" type="number" step="0.01" value="1.0">
+        </div>
+      </div>
+      <div class="split" style="margin-top:8px">
+        <div>
+          <label>오차 허용(%)</label>
+          <input class="ctrl" id="tolerance" type="number" step="0.01" value="0.1">
+        </div>
+        <div>
+          <label>레버리지</label>
+          <input class="ctrl" id="leverage" type="number" step="1" value="3">
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <label>진입 금액 (KRW)</label>
+        <input class="ctrl mono" id="amount_krw" type="number" step="1000" value="1000000">
+      </div>
 
-    function computeSizePreview(usdkrw) {
-      const amountKrw = parseFloat(document.getElementById('amount_krw').value) || 0;
-      const lev       = parseFloat(document.getElementById('leverage').value) || 1;
-      if (!usdkrw || usdkrw <= 0 || amountKrw <= 0 || lev <= 0) {
-        document.getElementById('target_size_usdt').innerText = '-';
-        document.getElementById('required_margin').innerText  = '-';
-        return;
+      <div class="row" style="margin-top:12px">
+        <button class="btn" id="btn-start">▶ 전략 시작</button>
+        <button class="btn secondary" id="btn-stop">■ 전략 중지</button>
+        <button class="btn ghost" id="btn-save">설정 저장</button>
+        <button class="btn ghost" id="btn-load">불러오기</button>
+      </div>
+
+      <p class="hint">※ 격리 모드 × 레버리지. 바이낸스 포지션 <b>사이즈 = 금액/환율</b>, <b>증거금 = 사이즈/레버리지</b>. 초고속 캐시 기반 UI.</p>
+
+      <div class="split" style="margin-top:10px">
+        <div class="kv">
+          <b>목표 사이즈</b><span><span id="target_size_usdt" class="hl mono">-</span> USDT</span>
+          <b>필요 증거금</b><span><span id="required_margin" class="hl mono">-</span> USDT</span>
+        </div>
+        <div>
+          <div class="kv">
+            <b>상태</b><span id="status-text" class="badge">-</span>
+            <b>포지션</b><span id="position" class="badge">-</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Target proximity -->
+      <div style="margin-top:10px">
+        <div class="kv" style="align-items:center">
+          <b>목표 근접도</b>
+          <div class="bar"><i id="prox-bar"></i></div>
+        </div>
+        <div class="row" style="justify-content:space-between; font-size:12px; color:var(--muted); margin-top:6px">
+          <span>현재 김프: <b id="prox-kimp" class="mono">-</b>%</span>
+          <span>목표: <b id="prox-target" class="mono">-</b>% ± <b id="prox-tol" class="mono">-</b>%</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 현재 상태 + 스파크라인 -->
+    <section class="card col-8">
+      <h3>시장 스냅샷</h3>
+      <div class="grid" style="gap:12px; grid-template-columns: repeat(12, 1fr);">
+        <div class="col-4">
+          <div class="kv">
+            <b>김프</b><span><span id="kimp" class="mono" style="font-weight:800">-</span> <span id="kimp-sign" class="badge">-</span></span>
+            <b>업비트</b><span class="mono" id="upbit_price">-</span>
+            <b>바이낸스</b><span class="mono" id="binance_price">-</span>
+            <b>환율</b><span class="mono" id="usdkrw">-</span>
+          </div>
+        </div>
+        <div class="col-8">
+          <div class="spark-wrap">
+            <canvas id="spark" class="spark"></canvas>
+            <div class="spark-val mono">
+              <small>최근 60초 범위</small>
+              <div><span id="spark-min">-</span> ~ <span id="spark-max">-</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <hr style="border:none; border-top:1px solid var(--border); margin:14px 0"/>
+
+      <div class="grid" style="gap:12px; grid-template-columns: repeat(12, 1fr);">
+        <div class="col-4 kv">
+          <b>총 거래수</b><span id="count" class="mono">0</span>
+          <b>누적 손익</b><span><span id="krw" class="mono hl">0</span> KRW</span>
+          <b>수익률</b><span><span id="pnl" class="mono hl">0</span> %</span>
+        </div>
+        <div class="col-4 kv">
+          <b>Upbit 진입</b><span id="entry_upbit_qty" class="mono">0.000</span>
+          <b>Binance 진입</b><span id="entry_binance_qty" class="mono">0.000</span>
+        </div>
+        <div class="col-4 kv">
+          <b>헬스</b><span id="health-badge" class="badge">-</span>
+          <b>API 오류</b><span id="metric-errors" class="badge bad">-</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 로그/메트릭 탭 -->
+    <section class="card col-12">
+      <div class="tabs">
+        <div class="tab active" data-tab="t1">거래 로그</div>
+        <div class="tab" data-tab="t2">구조화 로그(JSON)</div>
+        <div class="tab" data-tab="t3">메트릭</div>
+      </div>
+      <div class="panel active" id="t1">
+        <div class="row" style="margin-bottom:8px">
+          <button id="auto-scroll" class="btn ghost">자동 스크롤: ON</button>
+          <button id="download-log" class="btn ghost">로그 다운로드</button>
+          <span class="muted">최근 400줄까지 표시 · 단축키 <b>S</b> 시작 / <b>X</b> 정지 / <b>L</b> 오토스크롤</span>
+        </div>
+        <div id="log" class="log">Loading...</div>
+      </div>
+      <div class="panel" id="t2">
+        <div id="log-json" class="log" style="color:#b4e1ff">Loading...</div>
+      </div>
+      <div class="panel" id="t3">
+        <div class="kv">
+          <b>루프</b><span id="metric-loops" class="mono">-</span>
+          <b>바이낸스 주문</b><span id="metric-bn" class="mono">-</span>
+          <b>업비트 주문</b><span id="metric-up" class="mono">-</span>
+          <b>스레드</b><span id="metric-thread" class="mono">-</span>
+        </div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<script>
+  // ---------- 유틸 ----------
+  const $ = sel => document.querySelector(sel);
+  const isNum = v => typeof v === 'number' && isFinite(v);
+  const fx  = (v, n=2) => isNum(v) ? Number(v).toFixed(n) : '-';
+  const loc = v => isNum(v) ? Number(v).toLocaleString() : '-';
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function toast(title, msg='', ok=true){
+    const w = $('#toasts');
+    const el = document.createElement('div');
+    el.className = `toast ${ok ? 'ok':'err'}`;
+    el.innerHTML = `<div class="t">${title}</div><div class="muted">${msg}</div>`;
+    w.appendChild(el);
+    setTimeout(()=>{ el.style.opacity='0'; setTimeout(()=> w.removeChild(el), 300)}, 3200);
+  }
+
+  // ---------- 상태 ----------
+  let autoScroll = true;
+  let sparkData = []; // 최근 60점
+  let running = false;
+  let lastLogLen = 0;
+
+  // ---------- 스파크라인 ----------
+  function drawSpark(){
+    const c = $('#spark'); const ctx = c.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w = c.clientWidth, h = c.clientHeight;
+    if (c.width !== w*dpr) c.width = w*dpr; if (c.height !== h*dpr) c.height = h*dpr;
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    if (!sparkData.length){ return; }
+
+    const min = Math.min(...sparkData), max = Math.max(...sparkData);
+    $('#spark-min').textContent = fx(min,2);
+    $('#spark-max').textContent = fx(max,2);
+
+    const pad=6; const span = Math.max(1e-9, max-min);
+    // 그라디언트
+    const grad = ctx.createLinearGradient(0,0,w,0);
+    grad.addColorStop(0, '#7aa2ff'); grad.addColorStop(1, '#00e0c7');
+
+    // 영역 채우기
+    ctx.beginPath();
+    sparkData.forEach((v,i)=>{
+      const x = pad + (w-2*pad) * (i/(sparkData.length-1));
+      const y = h - pad - (h-2*pad) * ((v-min)/span);
+      i? ctx.lineTo(x,y): ctx.moveTo(x,y);
+    });
+    ctx.lineTo(w-pad,h-pad); ctx.lineTo(pad,h-pad); ctx.closePath();
+    ctx.fillStyle = 'rgba(122,162,255,0.08)';
+    ctx.fill();
+
+    // 라인
+    ctx.beginPath();
+    sparkData.forEach((v,i)=>{
+      const x = pad + (w-2*pad) * (i/(sparkData.length-1));
+      const y = h - pad - (h-2*pad) * ((v-min)/span);
+      i? ctx.lineTo(x,y): ctx.moveTo(x,y);
+    });
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = grad;
+    ctx.shadowColor = 'rgba(0,224,199,0.25)';
+    ctx.shadowBlur = 4;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  // ---------- 탭 ----------
+  document.querySelectorAll('.tab').forEach(t=>{
+    t.addEventListener('click', ()=>{
+      document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+      t.classList.add('active'); $('#'+t.dataset.tab).classList.add('active');
+    });
+  });
+
+  // ---------- 버튼/프리셋 ----------
+  $('#auto-scroll').addEventListener('click', ()=>{
+    autoScroll = !autoScroll;
+    $('#auto-scroll').textContent = `자동 스크롤: ${autoScroll?'ON':'OFF'}`;
+  });
+
+  $('#download-log').addEventListener('click', ()=>{
+    const text = $('#log').textContent || '';
+    const blob = new Blob([text], {type:'text/plain'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `logs_${Date.now()}.txt`;
+    a.click();
+  });
+
+  $('#btn-save').addEventListener('click', ()=>{
+    const cfg = readConfig();
+    localStorage.setItem('kimp_cfg', JSON.stringify(cfg));
+    toast('설정 저장 완료', '브라우저에 저장되었습니다.');
+  });
+
+  $('#btn-load').addEventListener('click', ()=>{
+    const raw = localStorage.getItem('kimp_cfg');
+    if (!raw){ toast('불러올 설정 없음', '먼저 저장해주세요.', false); return; }
+    try{
+      const cfg = JSON.parse(raw);
+      applyConfig(cfg);
+      toast('설정 불러옴', '입력값에 적용되었습니다.');
+    }catch(e){ toast('불러오기 실패', e.message, false); }
+  });
+
+  document.querySelectorAll('.preset').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const [t,e, tol, amt, lev] = btn.dataset.preset.split(',').map(Number);
+      applyConfig({target_kimp:t, exit_kimp:e, tolerance:tol, amount_krw:amt, leverage:lev});
+      toast('프리셋 적용', `타겟 ${t} → 청산 ${e} / 오차 ${tol} / 금액 ${amt.toLocaleString()} / 레버 ${lev}`);
+    });
+  });
+
+  $('#btn-start').addEventListener('click', startStrategy);
+  $('#btn-stop').addEventListener('click', stopStrategy);
+
+  // ---------- 설정 I/O ----------
+  function readConfig(){
+    const v = (sel) => parseFloat($(sel).value);
+    return {
+      target_kimp: v('#target_kimp'),
+      exit_kimp:   v('#exit_kimp'),
+      tolerance:   v('#tolerance'),
+      amount_krw:  v('#amount_krw'),
+      leverage:    v('#leverage'),
+    };
+  }
+  function applyConfig(cfg){
+    if (cfg.target_kimp!=null) $('#target_kimp').value = cfg.target_kimp;
+    if (cfg.exit_kimp!=null)   $('#exit_kimp').value   = cfg.exit_kimp;
+    if (cfg.tolerance!=null)   $('#tolerance').value   = cfg.tolerance;
+    if (cfg.amount_krw!=null)  $('#amount_krw').value  = cfg.amount_krw;
+    if (cfg.leverage!=null)    $('#leverage').value    = cfg.leverage;
+    // 근접도 패널 즉시 반영
+    $('#prox-target').textContent = fx(parseFloat($('#target_kimp').value),2);
+    $('#prox-tol').textContent    = fx(parseFloat($('#tolerance').value),2);
+  }
+  function validateConfig(cfg){
+    const errs = [];
+    if (!isFinite(cfg.target_kimp)) errs.push('목표 김프가 올바르지 않습니다.');
+    if (!isFinite(cfg.exit_kimp)) errs.push('청산 김프가 올바르지 않습니다.');
+    if (!(cfg.tolerance>=0 && cfg.tolerance<=5)) errs.push('오차 허용은 0~5% 사이여야 합니다.');
+    if (!(cfg.amount_krw>=10000)) errs.push('진입 금액은 최소 10,000 KRW이어야 합니다.');
+    if (!(cfg.leverage>=1 && cfg.leverage<=50)) errs.push('레버리지는 1~50 사이여야 합니다.');
+    return errs;
+  }
+
+  // ---------- 서버 통신(분할 폴링로 가볍게·빠르게) ----------
+  let inflight = {k:false, s:false, h:false, m:false, b:false};
+
+  async function fetchJson(url, opt){
+    const r = await fetch(url, opt);
+    if (!r.ok) throw new Error(`${url} ${r.status}`);
+    return r.json();
+  }
+
+  // 가벼운: 김프/가격/환율 (초고속 캐시 반영)
+  async function tickLight(){
+    if (inflight.k) return; inflight.k = true;
+    try{
+      const k = await fetchJson('/current_kimp');
+      // 숫자 표시
+      $('#kimp').textContent = fx(k.kimp,2);
+      $('#upbit_price').textContent = loc(k.upbit_price);
+      $('#binance_price').textContent = fx(k.binance_price,2);
+      $('#usdkrw').textContent = fx(k.usdkrw,2);
+      $('#kimp-brief').textContent =
+        `김프 ${fx(k.kimp,2)}% · 업비트 ${loc(k.upbit_price)} KRW · 바이낸스 ${fx(k.binance_price,2)} USDT · 환율 ${fx(k.usdkrw,2)}`;
+
+      // 스파크
+      sparkData.push(Number(k.kimp));
+      if (sparkData.length>60) sparkData.shift();
+      drawSpark();
+
+      // 근접도 게이지
+      const target = Number($('#target_kimp').value)||0;
+      const tol = Math.abs(Number($('#tolerance').value)||0);
+      $('#prox-kimp').textContent = fx(k.kimp,2);
+      $('#prox-target').textContent = fx(target,2);
+      $('#prox-tol').textContent = fx(tol,2);
+      const inside = (target<0) ? (k.kimp<=target+tol) : (k.kimp>=target-tol);
+      const dist = Math.abs(k.kimp - target);
+      const pct = Math.max(0, Math.min(100, 100 - (dist/(Math.max(0.01,tol))*100)));
+      $('#prox-bar').style.width = `${inside ? 100 : pct}%`;
+
+      // sign badge
+      const sign = $('#kimp-sign');
+      sign.textContent = k.kimp>=0 ? '프리미엄(+)':'디스카운트(-)';
+      sign.className = 'badge ' + (k.kimp>=0?'warn':'good');
+
+      // 목표 사이즈/증거금
+      const amount = Number($('#amount_krw').value)||0;
+      const lev = Number($('#leverage').value)||1;
+      const targetSize = (k.usdkrw>0) ? amount / k.usdkrw : 0;
+      const margin = (lev>0) ? targetSize/lev : 0;
+      $('#target_size_usdt').textContent = isFinite(targetSize) ? fx(targetSize,2) : '-';
+      $('#required_margin').textContent  = isFinite(margin) ? fx(margin,2) : '-';
+
+      // 런 배지 색
+      const rb = $('#run-badge'); const dot = rb.querySelector('.dot');
+      rb.title = 'Ultra-Fast cache snapshot';
+      dot.className = 'dot ' + (running ? 'ok':'danger');
+      rb.querySelector('span:last-child')?.remove;
+      rb.lastChild?.nodeType===3;
+    }catch(e){ /* 콘솔만 */ }
+    finally{ inflight.k = false; }
+  }
+
+  // 중간: 상태/로그
+  async function tickStatus(){
+    if (inflight.s) return; inflight.s = true;
+    try{
+      const s = await fetchJson('/status');
+      running = !!s.running;
+
+      $('#status-text').textContent = running ? '실행중' : '중지됨';
+      $('#status-text').className = `badge ${running?'good':'bad'}`;
+      $('#position').textContent = s.position_state ?? '-';
+      $('#count').textContent = s.trade_count ?? 0;
+
+      const pnl = isNum(s.total_pnl) ? s.total_pnl : 0;
+      const krw = isNum(s.profit_krw) ? s.profit_krw : 0;
+      $('#pnl').textContent = fx(pnl,2);
+      $('#krw').textContent = loc(krw);
+
+      const upQty = s.entry_info?.upbit_qty ?? 0;
+      const biQty = s.entry_info?.binance_qty ?? 0;
+      $('#entry_upbit_qty').textContent = Number(upQty).toFixed(3);
+      $('#entry_binance_qty').textContent = Number(biQty).toFixed(3);
+
+      // 로그(사람이 보는)
+      const L = Array.isArray(s.logs) ? s.logs : [];
+      if (L.length !== lastLogLen){
+        const el = $('#log');
+        el.textContent = L.join('\n');
+        lastLogLen = L.length;
+        if (autoScroll){ el.scrollTop = el.scrollHeight; }
       }
-      const targetSize = amountKrw / usdkrw;      // 사이즈(USDT)
-      const marginNeed = targetSize / lev;        // 증거금(USDT)
-      document.getElementById('target_size_usdt').innerText = safeFixed(targetSize, 2);
-      document.getElementById('required_margin').innerText  = safeFixed(marginNeed, 2);
-    }
+      // 구조화 로그(JSON)
+      const JL = Array.isArray(s.logs_json) ? s.logs_json : null;
+      if (JL){
+        $('#log-json').textContent = JL.map(j => JSON.stringify(j)).join('\n');
+      }
 
-    async function refresh() {
-      try {
-        // 1) 현재 김프/가격/환율
-        const k = await fetch('/current_kimp').then(res => res.json());
-        document.getElementById('kimp').innerText = safeFixed(k.kimp, 2);
-        document.getElementById('upbit_price').innerText = safeLocale(k.upbit_price);
-        document.getElementById('binance_price').innerText = safeFixed(k.binance_price, 2);
-        document.getElementById('usdkrw').innerText = safeFixed(k.usdkrw, 2);
+      // 상단 배지
+      const rb = $('#run-badge');
+      rb.innerHTML = `<i class="dot ${running?'ok':'danger'}"></i><span>${running?'Running':'Stopped'}</span>`;
 
-        // 헤더 요약
-        document.getElementById('kimp-info').innerText =
-          `김프 ${safeFixed(k.kimp,2)}% | 업비트 ${safeLocale(k.upbit_price)} KRW | 바이낸스 ${safeFixed(k.binance_price,2)} USDT | 환율 ${safeFixed(k.usdkrw,2)}`;
+      // 버튼 상태
+      $('#btn-start').disabled = running;
+      $('#btn-stop').disabled  = !running;
 
-        // 사이즈/증거금 미리보기 계산
-        computeSizePreview(k.usdkrw);
+    }catch(e){}
+    finally{ inflight.s = false; }
+  }
 
-        // 2) 상태
-        const s = await fetch('/status').then(res => res.json());
-        document.getElementById('status').innerText = s.running ? '실행중' : '중지됨';
-        document.getElementById('position').innerText = s.position_state ?? '-';
-        document.getElementById('count').innerText = s.trade_count ?? 0;
-        document.getElementById('pnl').innerText = isNum(s.total_pnl) ? s.total_pnl : 0;
-        document.getElementById('krw').innerText = isNum(s.profit_krw) ? safeLocale(s.profit_krw) : 0;
-
-        // 진입 수량 표시 (소수점 3자리 고정)
-        const upQty = (s.entry_info && isNum(s.entry_info.upbit_qty)) ? s.entry_info.upbit_qty : 0;
-        const biQty = (s.entry_info && isNum(s.entry_info.binance_qty)) ? s.entry_info.binance_qty : 0;
-        document.getElementById('entry_upbit_qty').innerText = Number(upQty).toFixed(3);
-        document.getElementById('entry_binance_qty').innerText = Number(biQty).toFixed(3);
-
-        // 로그 갱신 + 자동 스크롤
-        if (Array.isArray(s.logs) && s.logs.length !== lastLogCount) {
-          const logEl = document.getElementById('log');
-          logEl.innerText = s.logs.join('\n');
-          lastLogCount = s.logs.length;
-          logEl.scrollTop = logEl.scrollHeight;
+  // 무거운: 헬스/메트릭/잔고
+  async function tickHeavy(){
+    try{
+      if (!inflight.h){
+        inflight.h = true;
+        const h = await fetch('/health').then(r=>r.ok?r.json():null);
+        if (h){
+          const alive = h.thread_alive ? '스레드 OK' : '스레드 정지';
+          $('#health-badge').textContent = alive;
+          $('#health-badge').className = `badge ${h.thread_alive?'good':'bad'}`;
         }
-
-        // 3) 실제 잔고
-        const b = await fetch('/balance').then(res => res.json());
-        document.getElementById('real_krw').innerText = safeLocale(b?.real?.krw ?? 0);
-        document.getElementById('real_btc').innerText = safeFixed(b?.real?.btc_upbit ?? 0, 6);
-        document.getElementById('real_usdt').innerText = safeFixed(b?.real?.usdt ?? 0, 3);
-
-        // 버튼 상태 동기화
-        setButtons(s.running);
-
-      } catch (err) {
-        console.error('데이터 갱신 오류:', err);
+        inflight.h = false;
       }
-    }
-
-    async function startStrategy() {
-      const config = {
-        target_kimp: parseFloat(document.getElementById('target_kimp').value),
-        exit_kimp: parseFloat(document.getElementById('exit_kimp').value),
-        tolerance: parseFloat(document.getElementById('tolerance').value),
-        amount_krw: parseFloat(document.getElementById('amount_krw').value),
-        leverage: parseFloat(document.getElementById('leverage').value),
-      };
-      try {
-        await fetch('/start', {
-          method : 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body   : JSON.stringify(config),
-        });
-        setButtons(true);
-        alert('전략이 시작되었습니다.');
-      } catch (e) {
-        alert('전략 시작 중 오류가 발생했습니다.');
+      if (!inflight.m){
+        inflight.m = true;
+        const m = await fetch('/metrics').then(r=>r.ok?r.json():null);
+        if (m){
+          $('#metric-loops').textContent = m.loops ?? '-';
+          $('#metric-bn').textContent    = m.orders_binance ?? '-';
+          $('#metric-up').textContent    = m.orders_upbit ?? '-';
+          $('#metric-errors').textContent= m.api_errors ?? '-';
+          $('#metric-thread').textContent= running ? 'Alive' : 'Stopped';
+        }
+        inflight.m = false;
       }
-    }
-
-    async function stopStrategy() {
-      try {
-        await fetch('/stop', { method: 'POST' });
-        setButtons(false);
-        alert('전략이 중지되었습니다.');
-      } catch (e) {
-        alert('전략 중지 중 오류가 발생했습니다.');
+      if (!inflight.b){
+        inflight.b = true;
+        const b = await fetch('/balance').then(r=>r.ok?r.json():null);
+        // 잔고 숫자는 카드에 별도 표시는 안했지만, 추후 확장 시 여기에 활용 가능
+        inflight.b = false;
       }
+    }catch(e){
+      inflight.h = inflight.m = inflight.b = false;
     }
+  }
 
-    // 초기화
-    refresh();
-    setInterval(refresh, 1000);
-  </script>
+  async function startStrategy(){
+    const cfg = readConfig();
+    const errs = validateConfig(cfg);
+    if (errs.length){
+      toast('설정 오류', errs[0], false);
+      return;
+    }
+    try{
+      await fetch('/start',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg)});
+      toast('전략 시작', '전략 스레드를 구동합니다.');
+      $('#btn-start').disabled = true;
+      $('#btn-stop').disabled = false;
+    }catch(e){
+      toast('시작 실패', String(e), false);
+    }
+  }
+  async function stopStrategy(){
+    try{
+      await fetch('/stop',{method:'POST'});
+      toast('전략 중지', '전략 스레드를 종료합니다.');
+      $('#btn-start').disabled = false;
+      $('#btn-stop').disabled = true;
+    }catch(e){
+      toast('중지 실패', String(e), false);
+    }
+  }
+
+  // ---------- 라이프사이클 ----------
+  (function init(){
+    const raw = localStorage.getItem('kimp_cfg');
+    if (raw){ try{ applyConfig(JSON.parse(raw)); }catch{} }
+
+    // 핫키: S 시작, X 정지, L 자동스크롤 토글
+    window.addEventListener('keydown', (e)=>{
+      if (e.target.tagName === 'INPUT') return;
+      if (e.key==='s' || e.key==='S') startStrategy();
+      if (e.key==='x' || e.key==='X') stopStrategy();
+      if (e.key==='l' || e.key==='L') $('#auto-scroll').click();
+    });
+
+    // 초기 표기
+    $('#mode-badge').title = 'Backend market updater: 250ms prices / 20s FX';
+  })();
+
+  // 분할 폴링 간격 (가볍게 더 빠르게)
+  setInterval(tickLight, 350);   // 김프/가격/환율
+  setInterval(tickStatus, 900);  // 상태/로그
+  setInterval(tickHeavy, 2500);  // 헬스/메트릭/잔고
+  // 첫 렌더
+  tickLight(); tickStatus(); tickHeavy();
+  window.addEventListener('resize', drawSpark);
+</script>
 </body>
 </html>

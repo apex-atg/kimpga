@@ -1,0 +1,6 @@
+Host ncp-server
+    HostName 49.50.133.96
+    User ubuntu
+    Port 22
+    IdentityFile /c/Users/mycom/Desktop/kimpga/auto-key.pem
+    IdentitiesOnly yes

@@ -4,9 +4,11 @@ import time
 import uuid
 import hmac
 import jwt
+import json
 import hashlib
 import threading
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
+from collections import deque
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,7 +35,7 @@ def _make_session() -> requests.Session:
         allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=64)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
@@ -44,34 +46,180 @@ TIMEOUT = (3, 7)  # (connect, read) seconds
 
 
 # ===================== Global State =====================
-running: bool = False
-position_state: str = "neutral"          # neutral | entered
+MAX_LOGS = 1000
+
+running_evt = threading.Event()        # ▶ 전략 루프 on/off
+strategy_thread: Optional[threading.Thread] = None
+state_lock = threading.Lock()          # ▶ 상태/로그 보호
+
+position_state: str = "neutral"        # neutral | entered
 trade_count: int = 0
+
+# 가독용 누적 수익 (계산은 확장 시 추가)
 profit_krw: float = 0.0
 total_pnl: float = 0.0
 
-logs: list[str] = []
+# 가벼운 운영 메트릭
+metrics: Dict[str, float] = {
+    "loops": 0,
+    "api_errors": 0,
+    "orders_upbit": 0,
+    "orders_binance": 0,
+}
+
+# 로그: 사람이 읽는 로그 + 구조화 로그(최근 N개)
+logs = deque(maxlen=MAX_LOGS)
+logs_json = deque(maxlen=MAX_LOGS)
+
 entry_info: Dict[str, float] = {"upbit_qty": 0.0, "binance_qty": 0.0}
 
+# 트리거 보조
 _last_action_ts: float = 0.0
 COOLDOWN_SEC: float = 5.0
 
 # 진입 당시 김프 저장(청산 방향 판정용)
 entry_kimp_value: float | None = None
 
+# 중복 청산 가드
+exiting: bool = False
+
+
+# ===================== Logging =====================
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
+
 
 def log(msg: str) -> None:
-    ts = time.strftime("[%H:%M:%S]")
-    logs.append(f"{ts} {msg}")
-    if len(logs) > 300:
-        del logs[:100]
+    """사람이 읽기 쉬운 단순 로그"""
+    with state_lock:
+        logs.append(f"[{_ts()}] {msg}")
 
 
+def log_json(event: str, **fields) -> None:
+    """구조화 로그: event + key/val"""
+    payload = {"ts": _ts(), "event": event, **fields}
+    with state_lock:
+        logs_json.append(payload)
+        # 사람이 보는 로그에도 간단 버전 남김
+        logs.append(f"[{payload['ts']}] [{event}] {json.dumps(fields, ensure_ascii=False, sort_keys=True)}")
+
+
+# ===================== Utils =====================
 def floor_step(x: float, step: float) -> float:
     return (int(float(x) / step)) * step
 
 
-# ===================== Price & FX =====================
+def _safe_json(resp: requests.Response) -> Any:
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
+
+
+# ===================== 초고속 마켓 캐시 =====================
+class MarketCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.upbit: float = 0.0
+        self.binance: float = 0.0
+        self.usdkrw: float = 1300.0
+        self.ts_upbit: float = 0.0
+        self.ts_binance: float = 0.0
+        self.ts_fx: float = 0.0
+
+MARKET = MarketCache()
+PRICE_STALE_SEC = 2.0     # 시세는 2초 이상이면 스테일
+FX_REFRESH_SEC   = 20.0   # 환율은 20초마다 갱신
+_market_thread_started = False
+
+
+def _update_market_loop():
+    """업비트/바이낸스는 250ms 주기, 환율은 20s 주기로 갱신"""
+    upbit_url = "https://api.upbit.com/v1/ticker?markets=KRW-BTC"
+    binance_url = "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT"
+    headers_fx = {"User-Agent": "Mozilla/5.0"}
+
+    while True:
+        now = time.time()
+
+        # 업비트
+        try:
+            r1 = requests.get(upbit_url, timeout=(1, 2))
+            r1.raise_for_status()
+            up = float(r1.json()[0]["trade_price"])
+            with MARKET.lock:
+                MARKET.upbit = up
+                MARKET.ts_upbit = now
+        except Exception:
+            pass
+
+        # 바이낸스
+        try:
+            r2 = requests.get(binance_url, timeout=(1, 2))
+            r2.raise_for_status()
+            bi = float(r2.json()["price"])
+            with MARKET.lock:
+                MARKET.binance = bi
+                MARKET.ts_binance = now
+        except Exception:
+            pass
+
+        # 환율(비용 큼 → 드물게)
+        try:
+            if now - MARKET.ts_fx > FX_REFRESH_SEC:
+                html = requests.get("https://www.google.com/finance/quote/USD-KRW",
+                                    headers=headers_fx, timeout=(2, 4)).text
+                s = html.find('data-last-price="')
+                if s != -1:
+                    s += len('data-last-price="')
+                    e = html.find('"', s)
+                    v = float(html[s:e].replace(",", ""))
+                    if 900.0 <= v <= 2000.0:
+                        with MARKET.lock:
+                            MARKET.usdkrw = v
+                            MARKET.ts_fx = now
+        except Exception:
+            pass
+
+        time.sleep(0.25)  # 250ms
+
+
+def ensure_market_updater():
+    global _market_thread_started
+    if not _market_thread_started:
+        t = threading.Thread(target=_update_market_loop, daemon=True)
+        t.start()
+        _market_thread_started = True
+        log("[마켓캐시] 초고속 업데이트 쓰레드 시작 (0.25s / FX 20s)")
+
+
+def get_market_snapshot() -> Tuple[float, float, float, float]:
+    """
+    캐시를 우선 사용해 (kimp, upbit, binance, usdkrw)를 반환.
+    캐시가 오래됐으면 1회 폴백 호출로 보정 후 반환.
+    """
+    now = time.time()
+    with MARKET.lock:
+        up = MARKET.upbit
+        bp = MARKET.binance
+        fx = MARKET.usdkrw
+        tsu, tsb, tsf = MARKET.ts_upbit, MARKET.ts_binance, MARKET.ts_fx
+
+    # 스테일이면 폴백(부팅 직후 등)
+    if (now - tsu > PRICE_STALE_SEC) or (now - tsb > PRICE_STALE_SEC) or (now - tsf > 120.0):
+        up = get_upbit_price()
+        bp = get_binance_price()
+        fx = get_usdkrw()
+        with MARKET.lock:
+            MARKET.upbit, MARKET.ts_upbit = up, now
+            MARKET.binance, MARKET.ts_binance = bp, now
+            MARKET.usdkrw, MARKET.ts_fx = fx, now
+
+    k = ((up - bp * fx) / (bp * fx)) * 100.0
+    return round(k, 2), up, bp, fx
+
+
+# ===================== Price & FX (주문·잔고 등 기타에서 사용) =====================
 def get_upbit_price() -> float:
     url = "https://api.upbit.com/v1/ticker?markets=KRW-BTC"
     r = HTTP.get(url, timeout=TIMEOUT)
@@ -96,17 +244,20 @@ def get_usdkrw() -> float:
             return 1300.0
         s += len('data-last-price="')
         e = text.find('"', s)
-        return float(text[s:e].replace(",", ""))
+        v = float(text[s:e].replace(",", ""))
+        return v if 900.0 <= v <= 2000.0 else 1300.0
     except Exception:
         return 1300.0
 
 
-def calc_kimp() -> Tuple[float, float, float, float]:
-    up = get_upbit_price()
-    bp = get_binance_price()
-    fx = get_usdkrw()
-    k = ((up - bp * fx) / (bp * fx)) * 100.0
-    return round(k, 2), up, bp, fx
+def calc_kimp_snapshot() -> Tuple[float, float, float, float]:
+    """표시용 스냅샷: 캐시 우선"""
+    return get_market_snapshot()
+
+
+def calc_kimp_precise() -> Tuple[float, float, float, float]:
+    """판정용: 캐시 우선(스테일시 자동 폴백)"""
+    return get_market_snapshot()
 
 
 # ===================== Balance =====================
@@ -129,9 +280,12 @@ def get_upbit_balance_real() -> Tuple[float, float]:
             if b["currency"] == "KRW":
                 krw = float(b["balance"])
             elif b["currency"] == "BTC":
+                # 표시용: locked 포함
                 btc = float(b["balance"]) + float(b["locked"])
         return krw, btc
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[UPBIT 잔고 오류] {e}")
         return 0.0, 0.0
 
@@ -157,6 +311,8 @@ def get_binance_available_usdt() -> float:
                 return float(b.get("availableBalance", 0.0))
         return 0.0
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[BINANCE 잔고 오류] {e}")
         return 0.0
 
@@ -180,6 +336,8 @@ def get_binance_position_qty() -> float:
                 return float(p.get("positionAmt", 0.0))  # 숏이면 음수
         return 0.0
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[BINANCE 포지션 오류] {e}")
         return 0.0
 
@@ -207,6 +365,8 @@ def set_binance_leverage(symbol: str, leverage: int) -> bool:
         log(f"[바이낸스 레버리지 설정] {symbol} x{leverage} → {r.text}")
         return r.status_code == 200
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[레버리지 설정 오류] {e}")
         return False
 
@@ -223,6 +383,8 @@ def set_binance_isolated(symbol: str) -> bool:
             log(f"[마진모드 응답] {r.text} (이미 격리일 수 있음)")
             return True
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[마진모드 설정 오류] {e}")
         return False
 
@@ -243,7 +405,8 @@ def ensure_binance_margin_and_leverage(symbol: str, leverage: int) -> None:
                     if cur == leverage:
                         return
         except Exception:
-            pass
+            with state_lock:
+                metrics["api_errors"] += 1
     log(f"[경고] 레버리지 {leverage} 설정 확인 실패")
 
 
@@ -285,9 +448,13 @@ def upbit_order(side: str, price_krw: float, volume_btc: float) -> bool:
         headers = {"Authorization": f"Bearer {jwt_token}"}
 
         r = HTTP.post("https://api.upbit.com/v1/orders", params=query, headers=headers, timeout=TIMEOUT)
-        log(f"[업비트 주문] {side.upper()} vol={query.get('volume','')} price={query.get('price','')} → {r.text}")
+        with state_lock:
+            metrics["orders_upbit"] += 1
+        log(f"[업비트 주문] {side.upper()} vol={query.get('volume','')} price={query.get('price','')} → {_safe_json(r)}")
         return r.status_code == 201
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[업비트 주문 오류] {e}")
         return False
 
@@ -309,9 +476,13 @@ def binance_order(side: str, quantity: float, reduce_only: bool = False) -> bool
             },
         )
         r = HTTP.post(url, headers=headers, timeout=TIMEOUT)
-        log(f"[바이낸스 주문] {side.upper()} qty={format(qty,'.3f')} reduceOnly={reduce_only} → {r.text}")
+        with state_lock:
+            metrics["orders_binance"] += 1
+        log(f"[바이낸스 주문] {side.upper()} qty={format(qty,'.3f')} reduceOnly={reduce_only} → {_safe_json(r)}")
         return r.status_code == 200
     except Exception as e:
+        with state_lock:
+            metrics["api_errors"] += 1
         log(f"[바이낸스 주문 오류] {e}")
         return False
 
@@ -333,14 +504,14 @@ def adjust_binance_size_to_target(target_size_usdt: float, ref_price: float, tol
             return
         if diff > 0:
             binance_order("sell", qty, reduce_only=False)
-            log(f"[보정] 모자람 {round(diff,2)}USDT → 추가 SELL {qty} BTC")
+            log_json("size_adjust", action="sell_add", diff_usdt=round(diff,2), qty=qty)
         else:
             binance_order("buy", qty, reduce_only=True)
-            log(f"[보정] 초과 {round(-diff,2)}USDT → BUY(RO) {qty} BTC")
+            log_json("size_adjust", action="buy_reduce", diff_usdt=round(-diff,2), qty=qty)
         time.sleep(0.35)
 
 
-# ===================== Strategy =====================
+# ===================== Strategy Core =====================
 def _cooldown() -> bool:
     global _last_action_ts
     now = time.time()
@@ -350,8 +521,27 @@ def _cooldown() -> bool:
     return False
 
 
+def _validate_cfg(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """입력 파라미터 정규화/검증"""
+    def f(name: str, default: float, lo: float, hi: float) -> float:
+        try:
+            v = float(raw.get(name, default))
+        except Exception:
+            v = default
+        return max(lo, min(hi, v))
+
+    cfg = {
+        "target_kimp": f("target_kimp", 0.0, -10.0, 10.0),
+        "exit_kimp":   f("exit_kimp",   0.3, -10.0, 10.0),
+        "tolerance":   f("tolerance",   0.1,  0.0,  5.0),
+        "amount_krw":  f("amount_krw",  1_000_000, 10_000, 100_000_000),
+        "leverage":    int(f("leverage", 3, 1, 20)),
+    }
+    return cfg
+
+
 def run_strategy_thread(cfg: Dict[str, Any]) -> None:
-    global running, position_state, trade_count, entry_info, entry_kimp_value
+    global position_state, trade_count, entry_info, entry_kimp_value, exiting
 
     target_kimp = float(cfg["target_kimp"])
     exit_kimp   = float(cfg["exit_kimp"])
@@ -363,30 +553,36 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
 
     entry_upbit_qty = 0.0
 
-    while running:
+    while running_evt.is_set():
         try:
+            with state_lock:
+                metrics["loops"] += 1
+
+            # 쿨다운(너무 잦은 액션 방지)
             if _cooldown():
-                time.sleep(0.3)
+                time.sleep(0.25)
                 continue
 
-            kimp, up, bp, fx = calc_kimp()
+            # ▶ 판정용 김프: 캐시 스냅샷(스테일이면 자동 폴백)
+            kimp, up, bp, fx = calc_kimp_precise()
+            kimp_view = round(kimp, 2)
 
-            # -------- Entry --------
+            # ===== Entry =====
             if position_state == "neutral":
-                # 방향성 + 허용오차 버퍼
                 if target_kimp < 0:
                     near_ok = (kimp <= target_kimp + tolerance)
                 else:
                     near_ok = (kimp >= target_kimp - tolerance)
 
-                log(f"[체크] kimp={kimp}% target={target_kimp} tol={tolerance} near_ok={near_ok} state={position_state}")
+                log_json("check", kimp=kimp_view, target=target_kimp, tol=tolerance,
+                         near_ok=near_ok, state=position_state)
+
                 if not near_ok:
+                    time.sleep(0.4)
                     continue
 
-                # 업비트 수량(현물 금액 기준)
                 upbit_qty = round(amount_krw / up, 3)
 
-                # 바이낸스 목표 사이즈/증거금
                 target_size_usdt = amount_krw / fx
                 need_margin_usdt = target_size_usdt / leverage
                 avail_usdt = get_binance_available_usdt()
@@ -394,11 +590,13 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
 
                 if avail_usdt + 1e-6 < need_margin_usdt:
                     log("[진입 중단] 바이낸스 가용 USDT가 필요 증거금보다 적습니다.")
+                    time.sleep(1.0)
                     continue
 
                 ok_upbit = upbit_order("buy", amount_krw, upbit_qty)
                 if not ok_upbit:
                     log("[진입 실패] 업비트 매수 실패")
+                    time.sleep(0.6)
                     continue
 
                 first_qty = floor_step(target_size_usdt / bp, 0.001)
@@ -406,6 +604,7 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
                 if not ok_binance:
                     log("[진입 실패] 바이낸스 숏 실패 → 업비트 되돌림")
                     upbit_order("sell", 0.0, upbit_qty)
+                    time.sleep(0.6)
                     continue
 
                 time.sleep(0.6)
@@ -420,16 +619,35 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
                 entry_kimp_value = float(kimp)
                 log(f"[진입 성공] 업비트 {upbit_qty}BTC(≈{int(amount_krw)}KRW) / "
                     f"바이낸스 숏 사이즈≈{round(target_size_usdt,2)}USDT (격리 x{leverage}, 필요증거금≈{round(need_margin_usdt,2)}USDT) "
-                    f"@ 김프 {kimp}%")
+                    f"@ 김프 {kimp_view}%")
+                log_json("enter", kimp=kimp_view, entry_qty_upbit=upbit_qty,
+                         target_size_usdt=round(target_size_usdt,2), lev=leverage)
                 continue
 
-            # -------- Exit --------
+            # ===== Exit =====
             if position_state == "entered":
+                if exiting:
+                    time.sleep(0.2)
+                    continue
+
+                # 청산 직전 재계산
+                kimp2, up2, bp2, fx2 = calc_kimp_precise()
+                kimp2_view = round(kimp2, 2)
+
                 crossed = False
+                reason = ""
                 if entry_kimp_value is not None:
-                    crossed = (kimp >= exit_kimp) if exit_kimp >= entry_kimp_value else (kimp <= exit_kimp)
+                    if exit_kimp >= entry_kimp_value:
+                        crossed = (kimp2 >= exit_kimp)
+                        reason = f"kimp_now({kimp2_view}) >= exit_kimp({exit_kimp})"
+                    else:
+                        crossed = (kimp2 <= exit_kimp)
+                        reason = f"kimp_now({kimp2_view}) <= exit_kimp({exit_kimp})"
 
                 if crossed:
+                    exiting = True
+                    log_json("exit_trigger", entry=entry_kimp_value, exit_target=exit_kimp, reason=reason)
+
                     ok_upbit = upbit_order("sell", 0.0, entry_upbit_qty)
                     pos_amt = get_binance_position_qty()
                     ok_binance = True
@@ -437,22 +655,31 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
                         ok_binance = binance_order("buy", abs(pos_amt), reduce_only=True)
 
                     if ok_upbit and ok_binance:
-                        trade_count += 1
+                        with state_lock:
+                            global trade_count
+                            trade_count += 1
                         position_state = "neutral"
                         entry_info.update({"upbit_qty": 0.0, "binance_qty": 0.0})
-                        log(f"[청산 성공] 김프 {kimp}% (진입 {entry_kimp_value} → 청산선 {exit_kimp})")
+                        log(f"[청산 성공] 김프 {kimp2_view}% (진입 {entry_kimp_value} → 청산선 {exit_kimp})")
+                        log_json("exit_done", kimp=kimp2_view)
                         entry_kimp_value = None
+                        time.sleep(0.6)
                     else:
                         if not ok_upbit and ok_binance:
-                            log("[청산 일부실패] 업비트 실패 → 바이낸스 되돌림(숏 재진입 시도 필요)")
+                            log("[청산 일부실패] 업비트 실패 → 바이낸스 되돌림 필요 가능")
+                            log_json("exit_partial", side="upbit_fail")
                         elif ok_upbit and not ok_binance:
-                            log("[청산 일부실패] 바이낸스 실패 → 업비트 되돌림(매수 재진입 시도 필요)")
+                            log("[청산 일부실패] 바이낸스 실패 → 업비트 되돌림 필요 가능")
+                            log_json("exit_partial", side="binance_fail")
+                    exiting = False
                 continue
 
         except Exception as e:
+            with state_lock:
+                metrics["api_errors"] += 1
             log(f"[전략 오류] {e}")
 
-        time.sleep(0.5)
+        time.sleep(0.35)
 
 
 # ===================== Routes =====================
@@ -461,9 +688,41 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "ts": int(time.time())})
+
+
+@app.route("/health")
+def health():
+    with state_lock:
+        return jsonify({
+            "running": running_evt.is_set(),
+            "position_state": position_state,
+            "thread_alive": (strategy_thread.is_alive() if strategy_thread else False),
+            "loops": metrics["loops"],
+            "api_errors": metrics["api_errors"],
+        })
+
+
+@app.route("/metrics")
+def _metrics():
+    with state_lock:
+        return jsonify(metrics)
+
+
+@app.route("/config", methods=["GET"])
+def get_config():
+    return jsonify({
+        "cooldown_sec": COOLDOWN_SEC,
+        "max_logs": MAX_LOGS
+    })
+
+
 @app.route("/current_kimp")
 def current_kimp():
-    k, up, bp, fx = calc_kimp()
+    # 캐시 스냅샷(스테일시 1회 폴백)
+    k, up, bp, fx = calc_kimp_snapshot()
     return jsonify({"kimp": k, "upbit_price": up, "binance_price": bp, "usdkrw": fx})
 
 
@@ -476,43 +735,58 @@ def balance():
 
 @app.route("/status")
 def status():
-    return jsonify(
-        {
-            "running": running,
-            "position_state": position_state,
-            "trade_count": trade_count,
-            "logs": logs,
-            "entry_info": entry_info,
-        }
-    )
+    with state_lock:
+        return jsonify(
+            {
+                "running": running_evt.is_set(),
+                "position_state": position_state,
+                "trade_count": trade_count,
+                "profit_krw": round(profit_krw),
+                "total_pnl": total_pnl,
+                "logs": list(logs)[-400:],           # 과다 응답 방지
+                "logs_json": list(logs_json)[-400:], # 구조화 로그
+                "entry_info": entry_info,
+            }
+        )
 
 
 @app.route("/start", methods=["POST"])
 def start():
-    global running
-    if not running:
-        cfg_in = request.json or {}
-        cfg = {
-            "target_kimp": float(cfg_in.get("target_kimp", 0.0)),
-            "exit_kimp": float(cfg_in.get("exit_kimp", 0.3)),
-            "tolerance": float(cfg_in.get("tolerance", 0.1)),
-            "amount_krw": float(cfg_in.get("amount_krw", 1_000_000)),
-            "leverage": int(float(cfg_in.get("leverage", 3))),
-        }
-        running = True
-        threading.Thread(target=run_strategy_thread, args=(cfg,), daemon=True).start()
-        log(f"[전략 시작] cfg={cfg}")
-    return jsonify({"status": "started"})
+    global strategy_thread
+    cfg_raw = request.json or {}
+    cfg = _validate_cfg(cfg_raw)
+
+    # 초고속 캐시 스레드 보장
+    ensure_market_updater()
+
+    # 중복 시작 방지
+    if running_evt.is_set() and strategy_thread and strategy_thread.is_alive():
+        log_json("start_skip", reason="already_running", cfg=cfg)
+        return jsonify({"status": "already_running", "cfg": cfg}), 200
+
+    # 상태 리셋
+    with state_lock:
+        logs.clear(); logs_json.clear()
+        metrics["loops"] = 0
+        metrics["api_errors"] = 0
+
+    running_evt.set()
+    strategy_thread = threading.Thread(target=run_strategy_thread, args=(cfg,), daemon=True)
+    strategy_thread.start()
+    log_json("start", cfg=cfg)
+    return jsonify({"status": "started", "cfg": cfg}), 200
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
-    global running, entry_kimp_value
-    running = False
-    entry_kimp_value = None
-    log("[전략 중지]")
-    return jsonify({"status": "stopped"})
+    running_evt.clear()
+    log_json("stop_called")
+    time.sleep(0.2)  # 스레드 자연 종료 대기
+    return jsonify({"status": "stopped"}), 200
 
 
 if __name__ == "__main__":
+    # 서버 부팅 시 캐시 스레드 선구동(선택)
+    ensure_market_updater()
+    # 프로덕션: debug=False, 프록시 뒤에서 운영 권장
     app.run(host="0.0.0.0", port=5000, debug=False)
