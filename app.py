@@ -84,6 +84,12 @@ entry_kimp_value: float | None = None
 exiting: bool = False
 
 
+# ===================== Trading Safety Constants =====================
+UPBIT_BTC_STEP = 0.0001           # 업비트 BTC 최소 수량 스텝(보수적)
+UPBIT_MIN_KRW_ORDER = 5000        # 업비트 금액시장가 최소금액
+DUST_BTC = UPBIT_BTC_STEP / 2.0   # 이하면 실질적으로 0으로 간주
+
+
 # ===================== Logging =====================
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
@@ -215,6 +221,7 @@ def get_market_snapshot() -> Tuple[float, float, float, float]:
             MARKET.binance, MARKET.ts_binance = bp, now
             MARKET.usdkrw, MARKET.ts_fx = fx, now
 
+    # 김프 = 업비트 / (바낸 * 환율) - 1
     k = ((up - bp * fx) / (bp * fx)) * 100.0
     return round(k, 2), up, bp, fx
 
@@ -268,6 +275,8 @@ def get_upbit_balance_real() -> Tuple[float, float]:
 
     payload = {"access_key": access_key, "nonce": str(uuid.uuid4())}
     jwt_token = jwt.encode(payload, secret_key, algorithm="HS256")
+    if isinstance(jwt_token, (bytes, bytearray)):
+        jwt_token = jwt_token.decode()
     headers = {"Authorization": f"Bearer {jwt_token}"}
 
     try:
@@ -422,6 +431,10 @@ def upbit_order(side: str, price_krw: float, volume_btc: float) -> bool:
         secret_key = keys.get("upbit_secret", "")
 
         if side == "buy":
+            # 최소 금액 사전 차단
+            if int(price_krw) < UPBIT_MIN_KRW_ORDER:
+                log(f"[업비트 주문 차단] 금액 {int(price_krw)} KRW < 최소 {UPBIT_MIN_KRW_ORDER} KRW")
+                return False
             query = {
                 "market": "KRW-BTC",
                 "side": "bid",
@@ -429,11 +442,16 @@ def upbit_order(side: str, price_krw: float, volume_btc: float) -> bool:
                 "price": str(int(price_krw)),
             }
         else:
+            vol = floor_step(float(volume_btc), UPBIT_BTC_STEP)
+            if vol < UPBIT_BTC_STEP - 1e-12:
+                # 먼지는 실질 0
+                log(f"[업비트 매도 스킵] 잔량 {volume_btc:.8f} BTC < 최소 {UPBIT_BTC_STEP}")
+                return True
             query = {
                 "market": "KRW-BTC",
                 "side": "ask",
                 "ord_type": "market",
-                "volume": format(float(volume_btc), ".4f"),
+                "volume": format(vol, ".8f"),
             }
 
         m = hashlib.sha512()
@@ -445,6 +463,8 @@ def upbit_order(side: str, price_krw: float, volume_btc: float) -> bool:
             "query_hash_alg": "SHA512",
         }
         jwt_token = jwt.encode(payload, secret_key, algorithm="HS256")
+        if isinstance(jwt_token, (bytes, bytearray)):
+            jwt_token = jwt_token.decode()
         headers = {"Authorization": f"Bearer {jwt_token}"}
 
         r = HTTP.post("https://api.upbit.com/v1/orders", params=query, headers=headers, timeout=TIMEOUT)
@@ -511,6 +531,137 @@ def adjust_binance_size_to_target(target_size_usdt: float, ref_price: float, tol
         time.sleep(0.35)
 
 
+# ===================== Strategy helpers (무롤백 동시 진입 & 동시 청산) =====================
+def can_enter_now(amount_krw: float, leverage: int, fx: float, bi_price: float, margin_buffer: float = 1.02) -> Tuple[bool, str, Dict[str, float]]:
+    """
+    진입 전에 둘 다 '거의 확실히' 가능한지 확인
+    margin_buffer: 증거금 여유(예: +2%)
+    """
+    info: Dict[str, float] = {}
+    # 업비트 KRW 체크
+    krw, _ = get_upbit_balance_real()
+    if krw < amount_krw:
+        return False, f"업비트 KRW 부족 {int(krw):,} < {int(amount_krw):,}", info
+    # 바이낸스 마진 체크
+    target_size_usdt = amount_krw / fx
+    need_margin = (target_size_usdt / leverage) * margin_buffer
+    avail_usdt = get_binance_available_usdt()
+    info.update(target_size_usdt=target_size_usdt, need_margin=need_margin, avail_usdt=avail_usdt)
+    if avail_usdt + 1e-6 < need_margin:
+        return False, f"바이낸스 증거금 부족 {avail_usdt:.2f} < {need_margin:.2f}", info
+    return True, "OK", info
+
+
+def enter_both_sides_once_no_rollback(
+    amount_krw: float,
+    fx: float,
+    bi_price: float,
+    leverage: int = 3,
+    retries: int = 3,
+    wait_sec: float = 0.4,
+    confirm_timeout_sec: float = 3.0
+) -> tuple[bool, float, float]:
+    """
+    - 업비트 금액시장가와 바이낸스 수량시장가를 동시에 발사
+    - 실패한 쪽만 짧게 재시도(retries)
+    - 롤백은 절대 하지 않음
+    - 제한 시간 안에 양쪽 '실측' 보유/포지션이 확인되면 성공으로 간주
+    반환: (성공여부, 확정_upbit_qty(추정), 최초_binance_qty)
+    """
+    ok_u = False
+    ok_b = False
+
+    target_size_usdt = amount_krw / fx
+    init_qty = floor_step((target_size_usdt * 0.999) / bi_price, 0.001)  # -0.1% 여유
+    if init_qty <= 0:
+        log("[진입 중단] 계산된 초기 수량이 0")
+        return False, 0.0, 0.0
+
+    upbit_qty_est = round(amount_krw / get_upbit_price(), 3)  # 표시용 추정치
+
+    # 1) 동시 발사
+    def fire_upbit():
+        nonlocal ok_u
+        ok_u = upbit_order("buy", amount_krw, 0.0)
+
+    def fire_binance():
+        nonlocal ok_b
+        ok_b = binance_order("sell", init_qty, reduce_only=False)
+
+    t1 = threading.Thread(target=fire_upbit); t2 = threading.Thread(target=fire_binance)
+    t1.start(); t2.start()
+    t1.join(timeout=2.0); t2.join(timeout=2.0)
+
+    # 2) 실패한 쪽만 짧게 재시도
+    for _ in range(retries):
+        if not ok_u:
+            time.sleep(wait_sec)
+            ok_u = upbit_order("buy", amount_krw, 0.0) or ok_u
+        if not ok_b:
+            time.sleep(wait_sec)
+            ok_b = binance_order("sell", init_qty, reduce_only=False) or ok_b
+        if ok_u and ok_b:
+            break
+
+    # 3) 바이낸스 명목가치 보정
+    if ok_b:
+        time.sleep(0.5)
+        adjust_binance_size_to_target(target_size_usdt, ref_price=bi_price, tol_usdt=5.0)
+
+    # 4) 제한 시간 내 실측 확인
+    t_end = time.time() + confirm_timeout_sec
+    entered = False
+    while time.time() < t_end:
+        _, ub_qty_real = get_upbit_balance_real()
+        bn_qty = abs(get_binance_position_qty())
+        if ub_qty_real >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+            entered = True
+            break
+        time.sleep(0.25)
+
+    if entered:
+        log("[진입 확정] 롤백 없이 양쪽 체결 확인")
+        return True, upbit_qty_est, init_qty
+    else:
+        log("[경고] 부분 체결 상태 유지(롤백 비활성). 다음 루프에서 계속 보정")
+        return False, upbit_qty_est if ok_u else 0.0, init_qty if ok_b else 0.0
+
+
+def full_exit_with_retries(max_retries: int = 6, retry_delay: float = 1.2) -> bool:
+    """
+    업비트/바이낸스 동시 청산을 재시도하며 수행.
+    - 업비트: BTC 잔량을 0.0001 스텝으로 내림, DUST 이하는 0으로 간주
+    - 바이낸스: 포지션이 음수(숏)면 reduceOnly 시장가로 청산
+    """
+    for attempt in range(1, max_retries + 1):
+        _, ub_raw = get_upbit_balance_real()
+        ub = 0.0 if ub_raw <= DUST_BTC else floor_step(ub_raw, UPBIT_BTC_STEP)
+        pos = get_binance_position_qty()  # 숏이면 음수
+        need_up = ub >= UPBIT_BTC_STEP
+        need_bn = pos < -1e-6
+
+        log(f"[청산 체크#{attempt}] upbit={ub_raw:.8f}->{ub:.8f} BTC, binance_pos={pos}")
+
+        ok_u = True
+        ok_b = True
+        if need_up:
+            ok_u = upbit_order("sell", 0.0, ub)
+        if need_bn:
+            ok_b = binance_order("buy", abs(pos), reduce_only=True)
+
+        time.sleep(retry_delay)
+
+        _, ub_raw2 = get_upbit_balance_real()
+        ub2 = 0.0 if ub_raw2 <= DUST_BTC else floor_step(ub_raw2, UPBIT_BTC_STEP)
+        pos2 = get_binance_position_qty()
+        closed = (ub2 < UPBIT_BTC_STEP) and (-1e-6 <= pos2 <= 1e-6)
+
+        log(f"[청산 재확인#{attempt}] upbit={ub_raw2:.8f}->{ub2:.8f}, binance_pos={pos2}, result={'OK' if closed else 'RETRY'}")
+        if ok_u and ok_b and closed:
+            return True
+    return False
+
+
 # ===================== Strategy Core =====================
 def _cooldown() -> bool:
     global _last_action_ts
@@ -551,8 +702,6 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
 
     ensure_binance_margin_and_leverage("BTCUSDT", leverage)
 
-    entry_upbit_qty = 0.0
-
     while running_evt.is_set():
         try:
             with state_lock:
@@ -569,59 +718,63 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
 
             # ===== Entry =====
             if position_state == "neutral":
-                if target_kimp < 0:
-                    near_ok = (kimp <= target_kimp + tolerance)
-                else:
-                    near_ok = (kimp >= target_kimp - tolerance)
+                dir_ok  = (kimp <= target_kimp) if target_kimp < 0 else (kimp >= target_kimp)
+                near_ok = (kimp <= target_kimp + tolerance) if target_kimp < 0 else (kimp >= target_kimp - tolerance)
 
                 log_json("check", kimp=kimp_view, target=target_kimp, tol=tolerance,
-                         near_ok=near_ok, state=position_state)
+                         dir_ok=dir_ok, near_ok=near_ok, state=position_state)
 
-                if not near_ok:
+                if not (dir_ok and near_ok):
                     time.sleep(0.4)
                     continue
 
-                upbit_qty = round(amount_krw / up, 3)
+                # 프리체크(잔고/증거금 여유)
+                ok_gate, msg, info = can_enter_now(amount_krw, leverage, fx, bp, margin_buffer=1.02)
+                if not ok_gate:
+                    log(f"[진입 중단] {msg}")
+                    time.sleep(0.6)
+                    continue
 
+                log(f"[프리체크 OK] 목표≈{info['target_size_usdt']:.2f}USDT 필요증거금≈{info['need_margin']:.2f} 가용≈{info['avail_usdt']:.2f}")
+
+                # 무(無)롤백 동시 진입 + 실패쪽만 재시도
+                ok_enter, upbit_qty_est, init_qty = enter_both_sides_once_no_rollback(
+                    amount_krw, fx, bp, leverage=leverage, retries=3, wait_sec=0.4, confirm_timeout_sec=3.0
+                )
+
+                if not ok_enter:
+                    # 다음 루프에서 계속 보정/감시
+                    time.sleep(0.6)
+                    # 혹시 이미 완성됐는지 한 번 더 확인
+                    _, ub_qty_real = get_upbit_balance_real()
+                    bn_qty = abs(get_binance_position_qty())
+                    if ub_qty_real >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+                        entry_info["upbit_qty"] = floor_step(ub_qty_real, UPBIT_BTC_STEP)
+                        entry_info["binance_qty"] = floor_step(bn_qty, 0.001)
+                        position_state = "entered"
+                        entry_kimp_value = float(kimp)
+                        log("[진입 확정] 부분 체결 → 다음 루프에서 완성 확인")
+                    continue
+
+                # 진입 성공 시 명목가치 정밀 보정(한 번 더)
+                time.sleep(0.5)
                 target_size_usdt = amount_krw / fx
-                need_margin_usdt = target_size_usdt / leverage
-                avail_usdt = get_binance_available_usdt()
-                log(f"[검사] 목표사이즈≈{round(target_size_usdt,2)}USDT, 필요증거금≈{round(need_margin_usdt,2)}USDT, 가용≈{round(avail_usdt,2)}USDT")
-
-                if avail_usdt + 1e-6 < need_margin_usdt:
-                    log("[진입 중단] 바이낸스 가용 USDT가 필요 증거금보다 적습니다.")
-                    time.sleep(1.0)
-                    continue
-
-                ok_upbit = upbit_order("buy", amount_krw, upbit_qty)
-                if not ok_upbit:
-                    log("[진입 실패] 업비트 매수 실패")
-                    time.sleep(0.6)
-                    continue
-
-                first_qty = floor_step(target_size_usdt / bp, 0.001)
-                ok_binance = binance_order("sell", first_qty, reduce_only=False)
-                if not ok_binance:
-                    log("[진입 실패] 바이낸스 숏 실패 → 업비트 되돌림")
-                    upbit_order("sell", 0.0, upbit_qty)
-                    time.sleep(0.6)
-                    continue
-
-                time.sleep(0.6)
                 adjust_binance_size_to_target(target_size_usdt, ref_price=bp, tol_usdt=5.0)
 
-                entry_upbit_qty = upbit_qty
-                entry_info.update({
-                    "upbit_qty": upbit_qty,
-                    "binance_qty": floor_step(target_size_usdt / bp, 0.001)
-                })
-                position_state = "entered"
-                entry_kimp_value = float(kimp)
-                log(f"[진입 성공] 업비트 {upbit_qty}BTC(≈{int(amount_krw)}KRW) / "
-                    f"바이낸스 숏 사이즈≈{round(target_size_usdt,2)}USDT (격리 x{leverage}, 필요증거금≈{round(need_margin_usdt,2)}USDT) "
-                    f"@ 김프 {kimp_view}%")
-                log_json("enter", kimp=kimp_view, entry_qty_upbit=upbit_qty,
-                         target_size_usdt=round(target_size_usdt,2), lev=leverage)
+                # 최종 실측으로 상태 확정
+                _, ub_qty_real = get_upbit_balance_real()
+                bn_qty = abs(get_binance_position_qty())
+                if ub_qty_real >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+                    entry_info["upbit_qty"] = floor_step(ub_qty_real, UPBIT_BTC_STEP)
+                    entry_info["binance_qty"] = floor_step(bn_qty, 0.001)
+                    position_state = "entered"
+                    entry_kimp_value = float(kimp)
+                    log(f"[진입 확정] 업비트 +{entry_info['upbit_qty']}BTC(≈{int(amount_krw)}KRW) / "
+                        f"바이낸스 숏 ≈{round(target_size_usdt,2)}USDT (x{leverage}) @ 김프 {kimp_view}%")
+                    log_json("enter", kimp=kimp_view, entry_qty_upbit=entry_info['upbit_qty'],
+                             target_size_usdt=round(target_size_usdt,2), lev=leverage)
+                else:
+                    log(f"[진입 미완성] ub={ub_qty_real:.6f} BTC, bn={bn_qty:.6f} BTC — 다음 루프에서 보정")
                 continue
 
             # ===== Exit =====
@@ -648,13 +801,8 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
                     exiting = True
                     log_json("exit_trigger", entry=entry_kimp_value, exit_target=exit_kimp, reason=reason)
 
-                    ok_upbit = upbit_order("sell", 0.0, entry_upbit_qty)
-                    pos_amt = get_binance_position_qty()
-                    ok_binance = True
-                    if pos_amt < -1e-6:
-                        ok_binance = binance_order("buy", abs(pos_amt), reduce_only=True)
-
-                    if ok_upbit and ok_binance:
+                    done = full_exit_with_retries(max_retries=6, retry_delay=1.2)
+                    if done:
                         with state_lock:
                             global trade_count
                             trade_count += 1
@@ -665,12 +813,7 @@ def run_strategy_thread(cfg: Dict[str, Any]) -> None:
                         entry_kimp_value = None
                         time.sleep(0.6)
                     else:
-                        if not ok_upbit and ok_binance:
-                            log("[청산 일부실패] 업비트 실패 → 바이낸스 되돌림 필요 가능")
-                            log_json("exit_partial", side="upbit_fail")
-                        elif ok_upbit and not ok_binance:
-                            log("[청산 일부실패] 바이낸스 실패 → 업비트 되돌림 필요 가능")
-                            log_json("exit_partial", side="binance_fail")
+                        log("[청산 미완료] 잔량 남음. 루프 재시도")
                     exiting = False
                 continue
 
