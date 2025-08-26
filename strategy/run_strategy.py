@@ -1,59 +1,51 @@
-# run_strategy.py
 from __future__ import annotations
-import os, time, threading, requests, hmac, hashlib, uuid, jwt
+import time, threading, requests, hmac, hashlib, uuid, jwt, json
 from urllib.parse import urlencode
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple, Optional, List
+from api.api_key import load_api_keys
 
-# =============== 전역 상태 ===============
+# ===== 전역 상태 =====
 running: bool = False
 position_state: str = "neutral"      # neutral / entered
+exiting: bool = False                # 중복 청산 가드
 trade_count: int = 0
 profit_krw: float = 0.0              # 누적 실현손익(KRW)
-total_pnl: float = 0.0               # (확장용, 현재는 profit_krw와 동일하게만 사용 가능)
-logs: list[str] = []
+total_pnl: float = 0.0               # (유지: 필요 시 확장)
+logs: List[str] = []
 entry_info: Dict[str, float] = {"upbit_qty": 0.0, "binance_qty": 0.0}
 entry_kimp_value: float | None = None
-last_error: str | None = None
 
-# UI용 포지션 스냅샷
-current_position: Optional[Dict[str, Any]] = None  # live=True/False 포함
-last_position: Optional[Dict[str, Any]] = None     # 가장 최근 종료 포지션 스냅샷
+# 청산 직후 재진입 쿨다운
+last_exit_ts: float = 0.0
+EXIT_COOLDOWN_SEC: float = 3.0
 
-# 거래소 스텝/상수
-UPBIT_QTY_STEP = 0.0001
-BINANCE_QTY_STEP = 0.001
-BINANCE_SYMBOL = "BTCUSDT"
-RECV_WINDOW = 5000  # ms
-MAX_RETRY_ON_1021 = 1
+# 업비트 주문 관련 안전값
+UPBIT_BTC_STEP = 0.0001           # 최소 단위(보수적)
+UPBIT_MIN_KRW_ORDER = 5000        # 금액시장가 최소
+DUST_BTC = UPBIT_BTC_STEP / 2.0   # 이하면 0 간주
 
-# 테스트넷/메인넷 자동 분기
-BINANCE_TESTNET = str(os.getenv("BINANCE_TESTNET", "false")).lower() in ("1", "true", "yes")
-BASE_FAPI = "https://testnet.binancefuture.com" if BINANCE_TESTNET else "https://fapi.binance.com"
-
-# 바이낸스 시간 오프셋(ms)
-_binance_time_offset_ms: int = 0
-
-# PnL/원자성 추적
-state_lock = threading.RLock()
-entry: Dict[str, Any] = {
-    "ts": None, "qty": 0.0, "ub_avg": 0.0, "ub_fee_krw": 0.0,
-    "bn_avg": 0.0, "bn_fee_usdt": 0.0, "usdkrw_entry": 0.0,
-    "kimp_entry": None, "krw_spent": 0.0, "bn_notional_usdt": 0.0, "lev": 3
+# 사이클 체결/비용 기록
+current_cycle: Dict[str, Any] = {
+    "upbit_buy_uuid": None,
+    "upbit_sell_uuid": None,
+    "upbit_buy_krw": 0.0,
+    "upbit_sell_krw": 0.0,
+    "upbit_fee_krw": 0.0,
+    "binance_sell_id": None,   # 숏 진입
+    "binance_buy_id": None,    # 숏 청산
+    "binance_entry_qty": 0.0,
+    "binance_entry_avg": 0.0,
+    "binance_exit_qty": 0.0,
+    "binance_exit_avg": 0.0,
+    "binance_fee_usdt": 0.0
 }
-last_realized_krw: float = 0.0
-last_roi_pct: float = 0.0
 
-DUST_BTC = 1e-6  # 미세 잔량 경계
-
-# =============== 공통 유틸 ===============
+# --------------------- utils ---------------------
 def log(msg: str) -> None:
     ts = time.strftime("[%H:%M:%S]")
     logs.append(f"{ts} {msg}")
     if len(logs) > 400:
-        del logs[:200]
-
-def floor_step(x: float, step: float) -> float:
-    return int(float(x) / step) * step
+        logs.pop(0)
 
 def get_upbit_price() -> float:
     r = requests.get("https://api.upbit.com/v1/ticker?markets=KRW-BTC", timeout=10)
@@ -61,607 +53,870 @@ def get_upbit_price() -> float:
     return float(r.json()[0]['trade_price'])
 
 def get_binance_price() -> float:
-    r = requests.get(f"{BASE_FAPI}/fapi/v1/ticker/price", params={"symbol": BINANCE_SYMBOL}, timeout=10)
+    r = requests.get("https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT", timeout=10)
     r.raise_for_status()
     return float(r.json()['price'])
 
 def get_usdkrw() -> float:
     try:
-        r = requests.get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=5)
-        return float(r.json()[0]["trade_price"])
+        url = "https://www.google.com/finance/quote/USD-KRW"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        text = r.text
+        s = text.find('data-last-price="')
+        if s == -1:
+            return 1300.0
+        s += len('data-last-price="')
+        e = text.find('"', s)
+        v = float(text[s:e].replace(',', ''))
+        return v if 900.0 <= v <= 2000.0 else 1300.0
     except Exception:
         return 1300.0
 
-# =============== Upbit ===============
-def _upbit_headers(query: dict | None = None) -> dict:
-    from api.api_key import load_api_keys
+def calc_kimp(up_krw: float, bi_usdt: float, usdkrw: float) -> float:
+    # 김치프리미엄(%) = 업비트KRW / (바이낸스USDT*환율) - 1
+    return (up_krw / (bi_usdt * usdkrw) - 1.0) * 100.0
+
+def floor_step(x: float, step: float) -> float:
+    return (int(float(x) / step)) * step
+
+# ========== 초고속 마켓 캐시 ==========
+class MarketCache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.upbit: float = 0.0
+        self.binance: float = 0.0
+        self.usdkrw: float = 1300.0
+        self.ts_upbit: float = 0.0
+        self.ts_binance: float = 0.0
+        self.ts_fx: float = 0.0
+
+MARKET = MarketCache()
+PRICE_STALE_SEC = 2.0     # 시세는 2초 이상이면 스테일
+FX_REFRESH_SEC   = 20.0   # 환율은 20초마다 갱신
+_market_thread_started = False
+
+def _update_market_loop():
+    """업비트/바이낸스는 250ms 주기, 환율은 20s 주기로 갱신"""
+    upbit_url = "https://api.upbit.com/v1/ticker?markets=KRW-BTC"
+    binance_url = "https://fapi.binance.com/fapi/v1/ticker/price?symbol=BTCUSDT"
+    headers_fx = {"User-Agent": "Mozilla/5.0"}
+
+    while True:
+        now = time.time()
+        try:
+            r1 = requests.get(upbit_url, timeout=(1, 2))
+            r1.raise_for_status()
+            up = float(r1.json()[0]["trade_price"])
+            with MARKET.lock:
+                MARKET.upbit = up
+                MARKET.ts_upbit = now
+        except Exception:
+            pass
+
+        try:
+            r2 = requests.get(binance_url, timeout=(1, 2))
+            r2.raise_for_status()
+            bi = float(r2.json()["price"])
+            with MARKET.lock:
+                MARKET.binance = bi
+                MARKET.ts_binance = now
+        except Exception:
+            pass
+
+        try:
+            if now - MARKET.ts_fx > FX_REFRESH_SEC:
+                html = requests.get("https://www.google.com/finance/quote/USD-KRW",
+                                    headers=headers_fx, timeout=(2, 4)).text
+                s = html.find('data-last-price="')
+                if s != -1:
+                    s += len('data-last-price="')
+                    e = html.find('"', s)
+                    v = float(html[s:e].replace(",", ""))
+                    if 900.0 <= v <= 2000.0:
+                        with MARKET.lock:
+                            MARKET.usdkrw = v
+                            MARKET.ts_fx = now
+        except Exception:
+            pass
+
+        time.sleep(0.25)  # 250ms
+
+def ensure_market_updater():
+    global _market_thread_started
+    if not _market_thread_started:
+        t = threading.Thread(target=_update_market_loop, daemon=True)
+        t.start()
+        _market_thread_started = True
+        log("[마켓캐시] 초고속 업데이트 쓰레드 시작 (0.25s / FX 20s)")
+
+def get_market_snapshot() -> Tuple[float, float, float, float]:
+    """
+    캐시를 우선 사용해 (kimp, upbit, binance, usdkrw)를 반환.
+    캐시가 오래됐으면 1회 폴백 호출로 보정 후 반환.
+    """
+    now = time.time()
+    with MARKET.lock:
+        up = MARKET.upbit
+        bi = MARKET.binance
+        fx = MARKET.usdkrw
+        tsu, tsb, tsf = MARKET.ts_upbit, MARKET.ts_binance, MARKET.ts_fx
+
+    if (now - tsu > PRICE_STALE_SEC) or (now - tsb > PRICE_STALE_SEC) or (now - tsf > 120.0):
+        # 폴백: 직접 호출(상대적으로 느리지만 1회 보정)
+        up = get_upbit_price()
+        bi = get_binance_price()
+        fx = get_usdkrw()
+        with MARKET.lock:
+            MARKET.upbit, MARKET.ts_upbit = up, now
+            MARKET.binance, MARKET.ts_binance = bi, now
+            MARKET.usdkrw, MARKET.ts_fx = fx, now
+
+    k = calc_kimp(up, bi, fx)
+    return round(k, 2), up, bi, fx
+
+# ----------------- Upbit -----------------
+def upbit_auth_headers(with_query: bool, query: dict | None = None) -> dict:
     keys = load_api_keys()
     access_key, secret_key = keys.get('upbit_key', ""), keys.get('upbit_secret', "")
     payload = {"access_key": access_key, "nonce": str(uuid.uuid4())}
-    if query is not None:
+    if with_query and query is not None:
         q = urlencode(query).encode()
         m = hashlib.sha512(); m.update(q)
         payload["query_hash"] = m.hexdigest()
         payload["query_hash_alg"] = "SHA512"
     jwt_token = jwt.encode(payload, secret_key, algorithm="HS256")
+    if isinstance(jwt_token, (bytes, bytearray)):
+        jwt_token = jwt_token.decode()
     return {"Authorization": f"Bearer {jwt_token}"}
 
 def get_upbit_btc_balance() -> float:
-    r = requests.get("https://api.upbit.com/v1/accounts", headers=_upbit_headers(), timeout=10)
-    r.raise_for_status()
-    for a in r.json():
-        if a["currency"] == "BTC":
-            return float(a["balance"])  # locked 제외
-    return 0.0
+    try:
+        headers = upbit_auth_headers(False)
+        r = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
+        r.raise_for_status()
+        for a in r.json():
+            if a["currency"] == "BTC":
+                return float(a["balance"])
+        return 0.0
+    except requests.HTTPError as e:
+        log(f"[UPBIT 잔고 오류] {e.response.status_code} {e.response.text[:200]}")
+        raise
+    except Exception as e:
+        log(f"[UPBIT 잔고 오류] {e}")
+        raise
 
-def upbit_get_order(uuid_: str) -> dict:
-    q = {"uuid": uuid_}
-    r = requests.get("https://api.upbit.com/v1/order", params=q, headers=_upbit_headers(q), timeout=10)
+def get_upbit_krw_balance() -> float:
+    try:
+        headers = upbit_auth_headers(False)
+        r = requests.get("https://api.upbit.com/v1/accounts", headers=headers, timeout=10)
+        r.raise_for_status()
+        for a in r.json():
+            if a["currency"] == "KRW":
+                return float(a["balance"])
+        return 0.0
+    except requests.HTTPError as e:
+        log(f"[UPBIT 잔고 오류] {e.response.status_code} {e.response.text[:200]}")
+        raise
+    except Exception as e:
+        log(f"[UPBIT 잔고 오류] {e}")
+        raise
+
+def upbit_order(side: str, price_krw: float, volume_btc: float) -> Tuple[bool, Optional[str]]:
+    """
+    buy: KRW 금액 시장가 / sell: BTC 수량 시장가
+    반환: (성공여부, uuid)
+    """
+    try:
+        if side == 'buy':
+            if int(price_krw) < UPBIT_MIN_KRW_ORDER:
+                log(f"[업비트 주문 차단] 금액 {int(price_krw)} KRW < 최소 {UPBIT_MIN_KRW_ORDER} KRW")
+                return False, None
+            query = {"market": "KRW-BTC", "side": "bid", "ord_type": "price", "price": str(int(price_krw))}
+        else:
+            vol = floor_step(float(volume_btc), UPBIT_BTC_STEP)
+            if vol < UPBIT_BTC_STEP - 1e-12:
+                log(f"[업비트 매도 스킵] 잔량 {volume_btc:.8f} BTC < 최소 {UPBIT_BTC_STEP}")
+                return True, None
+            query = {"market": "KRW-BTC", "side": "ask", "ord_type": "market", "volume": format(vol, ".8f")}
+        headers = upbit_auth_headers(True, query)
+        r = requests.post("https://api.upbit.com/v1/orders", params=query, headers=headers, timeout=10)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text}
+        log(f"[업비트 주문] {side.upper()} vol={query.get('volume','')} price={query.get('price','')} → {json.dumps(data, ensure_ascii=False)}")
+        r.raise_for_status()
+        if isinstance(data, dict) and "uuid" in data:
+            return True, data["uuid"]
+        return False, None
+    except requests.HTTPError as e:
+        log(f"[업비트 주문 오류] {e.response.status_code} {e.response.text[:200]}")
+        return False, None
+    except Exception as e:
+        log(f"[업비트 주문 오류] {e}")
+        return False, None
+
+def upbit_order_detail(uuid_str: str) -> dict:
+    q = {"uuid": uuid_str}
+    headers = upbit_auth_headers(True, q)
+    url = "https://api.upbit.com/v1/order"
+    r = requests.get(url, headers=headers, params=q, timeout=10)
     r.raise_for_status()
     return r.json()
 
-def upbit_get_fill(uuid_: str) -> dict:
+def summarize_upbit_order(uuid_str: str) -> Tuple[float, float, float]:
     """
-    반환: {"filled_qty": float, "avg_price": float, "fee_krw": float}
-    (시장가 주문 기준 / paid_fee는 매수: KRW, 매도: BTC일 수 있음)
+    uuid 기준으로 체결 합산
+    반환: (총KRW금액, 총BTC수량, 수수료KRW)
     """
-    od = upbit_get_order(uuid_)
-    filled = float(od.get("executed_volume", 0.0) or 0.0)
-    fee = float(od.get("paid_fee", 0.0) or 0.0)
-    trades = od.get("trades", []) or []
-    notional = 0.0
-    for t in trades:
-        px = float(t.get("price", 0.0)); vol = float(t.get("volume", 0.0))
-        notional += px * vol
-    avg = (notional / filled) if filled > 0 else 0.0
-    if od.get("side") == "bid":  # 매수면 KRW 수수료
-        fee_krw = fee
-    else:                       # 매도면 BTC 수수료 → KRW 환산
-        fee_krw = fee * get_upbit_price()
-    return {"filled_qty": filled, "avg_price": avg, "fee_krw": fee_krw}
+    d = upbit_order_detail(uuid_str)
+    side = d.get("side")
+    paid_fee = float(d.get("paid_fee", "0") or 0.0)
+    total_funds = 0.0
+    total_volume = 0.0
+    for t in d.get("trades", []):
+        vol = float(t.get("volume", "0"))
+        funds = float(t.get("funds", "0"))  # KRW
+        total_volume += vol
+        total_funds += funds
+    if side == "bid":     # 매수
+        return total_funds, total_volume, paid_fee
+    else:                 # 매도
+        return total_funds, total_volume, paid_fee
 
-def upbit_market_buy_by_krw(amount_krw: float) -> tuple[bool, float, str, str]:
-    before = get_upbit_btc_balance()
-    q = {"market":"KRW-BTC","side":"bid","ord_type":"price","price":str(int(amount_krw))}
-    r = requests.post("https://api.upbit.com/v1/orders", params=q, headers=_upbit_headers(q), timeout=10)
-    text = r.text
-    log(f"[업비트 매수] KRW={int(amount_krw)} → {text[:200]}")
-    if r.status_code != 201:
-        return False, 0.0, text, ""
-    uuid_ = ""
+# ----------------- Binance Futures -----------------
+def _bn_keys():
+    keys = load_api_keys()
+    return keys.get('binance_key', ""), keys.get('binance_secret', "")
+
+# 서버 시간 오프셋(ms)
+BN_TIME_OFFSET_MS = 0
+
+def _now_ms() -> int:
+    return int(time.time() * 1000) + BN_TIME_OFFSET_MS
+
+def sync_binance_time() -> None:
+    global BN_TIME_OFFSET_MS
     try:
-        uuid_ = r.json().get("uuid", "")
-    except Exception:
-        pass
-    # 잔고차로 체결 수량 1차 추정
-    got = 0.0
-    for _ in range(8):
-        time.sleep(0.5)
-        after = get_upbit_btc_balance()
-        got = max(0.0, round(after - before, 8))
-        if got > 0:
-            break
-    return (got > 0), got, text, uuid_
-
-def upbit_market_sell_btc(volume_btc: float) -> tuple[bool, str, str]:
-    vol = format(floor_step(volume_btc, UPBIT_QTY_STEP), ".8f")
-    q = {"market":"KRW-BTC","side":"ask","ord_type":"market","volume":vol}
-    r = requests.post("https://api.upbit.com/v1/orders", params=q, headers=_upbit_headers(q), timeout=10)
-    text = r.text
-    log(f"[업비트 매도] vol={vol} → {text[:200]}")
-    uuid_ = ""
-    try:
-        if r.status_code == 201:
-            uuid_ = r.json().get("uuid", "")
-    except Exception:
-        pass
-    return (r.status_code == 201), text, uuid_
-
-# =============== Binance Futures 공통 ===============
-def _binance_keys() -> Tuple[str, str]:
-    from api.api_key import load_api_keys
-    k = load_api_keys()
-    return k.get('binance_key', ""), k.get('binance_secret', "")
-
-def _bn_now_ms() -> int:
-    return int(time.time()*1000) + _binance_time_offset_ms
-
-def _bn_headers() -> dict:
-    api_key, _ = _binance_keys()
-    return {"X-MBX-APIKEY": api_key, "Content-Type": "application/x-www-form-urlencoded"}
-
-def _bn_sign(params: Dict[str, Any]) -> str:
-    _, sec = _binance_keys()
-    qs = urlencode(params, doseq=True)
-    sig = hmac.new(sec.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    return qs + "&signature=" + sig
-
-def _is_ts_error(resp_text: str) -> bool:
-    t = (resp_text or "").lower()
-    return "-1021" in t or ("timestamp" in t and ("ahead" in t or "recvwindow" in t or "server time" in t))
-
-def sync_binance_server_time() -> None:
-    global _binance_time_offset_ms
-    try:
-        r = requests.get(f"{BASE_FAPI}/fapi/v1/time", timeout=5)
+        r = requests.get("https://fapi.binance.com/fapi/v1/time", timeout=5)
         r.raise_for_status()
-        st = int(r.json()["serverTime"])
-        _binance_time_offset_ms = st - int(time.time()*1000)
-        log(f"[바이낸스 시간동기] offset={_binance_time_offset_ms}ms (testnet={BINANCE_TESTNET})")
+        srv = int(r.json().get("serverTime", 0))
+        local = int(time.time() * 1000)
+        BN_TIME_OFFSET_MS = srv - local
+        log(f"[시계 동기화] binance Δ={BN_TIME_OFFSET_MS}ms")
     except Exception as e:
-        log(f"[시간동기 실패] {e}")
-        _binance_time_offset_ms = 0
+        log(f"[시계 동기화 실패] {e} (기본 오프셋 0ms 사용)")
+        BN_TIME_OFFSET_MS = 0
 
-def _bn_signed_get(path: str, params: Optional[Dict[str, Any]]=None, retry:int=MAX_RETRY_ON_1021):
-    if params is None: params = {}
-    params["timestamp"] = _bn_now_ms()
-    params["recvWindow"] = RECV_WINDOW
-    url = f"{BASE_FAPI}{path}?{_bn_sign(params)}"
-    r = requests.get(url, headers=_bn_headers(), timeout=10)
-    if r.status_code == 400 and retry>0 and _is_ts_error(r.text):
-        log("[경고] -1021 감지(GET) → 시간 재동기화 후 재시도")
-        sync_binance_server_time()
-        return _bn_signed_get(path, params, retry-1)
-    return r
-
-def _bn_signed_post(path: str, params: Optional[Dict[str, Any]]=None, retry:int=MAX_RETRY_ON_1021):
-    if params is None: params = {}
-    params["timestamp"] = _bn_now_ms()
-    params["recvWindow"] = RECV_WINDOW
-    url = f"{BASE_FAPI}{path}"
-    body = _bn_sign(params)
-    r = requests.post(url, headers=_bn_headers(), data=body, timeout=10)
-    if r.status_code == 400 and retry>0 and _is_ts_error(r.text):
-        log("[경고] -1021 감지(POST) → 시간 재동기화 후 재시도")
-        sync_binance_server_time()
-        return _bn_signed_post(path, params, retry-1)
-    return r
-
-# =============== Binance 기능 ===============
-def ensure_one_way_mode() -> bool:
-    try:
-        r = _bn_signed_post("/fapi/v1/positionSide/dual", {"dualSidePosition": "false"})
-        log(f"[바이낸스 모드] 원웨이 설정 → {r.status_code}, {r.text[:160]}")
-        if r.status_code == 200:
-            return True
-        if r.status_code in (401, 403) or '"code":-2015' in r.text:
-            global last_error
-            last_error = "binance_invalid_key_or_permission (-2015)"
-        return False
-    except Exception as e:
-        log(f"[모드설정 오류] {e}")
-        return False
-
-def set_margin_mode(symbol: str, isolated: bool=True) -> bool:
-    try:
-        r = _bn_signed_post("/fapi/v1/marginType", {"symbol": symbol, "marginType": ("ISOLATED" if isolated else "CROSSED")})
-        ok_text = r.text.lower()
-        ok = (r.status_code == 200) or ("no need to change" in ok_text) or ("margin type same" in ok_text)
-        log(f"[마진모드] ISOLATED={isolated} → {r.status_code}, {r.text[:160]}")
-        if not ok and ('"code":-2015' in r.text):
-            global last_error
-            last_error = "binance_invalid_key_or_permission (-2015)"
-        return ok
-    except Exception as e:
-        log(f"[마진모드 오류] {e}")
-        return False
+def _bn_signed_url(path: str, params: dict) -> tuple[str, dict]:
+    api_key, api_secret = _bn_keys()
+    params = {k: v for k, v in params.items() if v is not None}
+    params.setdefault("timestamp", _now_ms())
+    params.setdefault("recvWindow", 5000)
+    qs = urlencode(params)
+    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    url = f"https://fapi.binance.com{path}?{qs}&signature={sig}"
+    headers = {"X-MBX-APIKEY": api_key}
+    return url, headers
 
 def set_binance_leverage(symbol: str, leverage: int) -> bool:
     try:
-        r = _bn_signed_post("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
-        log(f"[레버리지] {symbol} x{leverage} → {r.status_code}, {r.text[:160]}")
-        if r.status_code != 200 and ('"code":-2015' in r.text):
-            global last_error
-            last_error = "binance_invalid_key_or_permission (-2015)"
-        return r.status_code == 200
+        url, headers = _bn_signed_url("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+        r = requests.post(url, headers=headers, timeout=10)
+        log(f"[바이낸스 레버리지 설정] {symbol} x{leverage} → {r.text}")
+        r.raise_for_status()
+        return True
+    except requests.HTTPError as e:
+        log(f"[레버리지 설정 오류] {e.response.status_code} {e.response.text[:200]}")
+        return False
     except Exception as e:
-        log(f"[레버리지 오류] {e}")
+        log(f"[레버리지 설정 오류] {e}")
         return False
 
-def get_binance_position_qty() -> float:
+def set_binance_isolated(symbol: str) -> bool:
     try:
-        r = _bn_signed_get("/fapi/v2/positionRisk")
-        if r.status_code != 200:
-            log(f"[포지션 조회 실패] {r.status_code}, {r.text[:200]}")
-            return 0.0
-        for p in r.json():
-            if p.get("symbol") == BINANCE_SYMBOL:
-                return float(p.get("positionAmt", 0.0))  # 숏<0, 롱>0
+        url, headers = _bn_signed_url("/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"})
+        r = requests.post(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            log(f"[마진모드] {symbol} 격리(ISOLATED) 설정 완료")
+            return True
+        else:
+            log(f"[마진모드 응답] {r.text} (환경상 격리 변경 불가일 수 있음)")
+            return True
+    except requests.HTTPError as e:
+        log(f"[마진모드 설정 오류] {e.response.status_code} {e.response.text[:200]}")
+        return False
     except Exception as e:
-        log(f"[포지션 조회 예외] {e}")
+        log(f"[마진모드 설정 오류] {e}")
+        return False
+
+def get_binance_leverage(symbol: str = "BTCUSDT") -> int:
+    api_key, api_secret = _bn_keys()
+    qs = urlencode({"timestamp": _now_ms(), "recvWindow": 5000})
+    url = f"https://fapi.binance.com/fapi/v2/positionRisk?{qs}&signature=" + hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    r = requests.get(url, headers={"X-MBX-APIKEY": api_key}, timeout=10)
+    r.raise_for_status()
+    for p in r.json():
+        if p.get("symbol") == symbol:
+            try:
+                return int(float(p.get("leverage", "0")))
+            except Exception:
+                return 0
+    return 0
+
+def ensure_binance_margin_and_leverage(symbol: str = "BTCUSDT", leverage: int = 3) -> None:
+    set_binance_isolated(symbol)
+    for _ in range(3):
+        set_binance_leverage(symbol, leverage)
+        time.sleep(0.3)
+        cur = get_binance_leverage(symbol)
+        log(f"[레버리지 확인] 현재={cur}, 목표={leverage}")
+        if cur == leverage:
+            return
+    log(f"[경고] 레버리지 {leverage} 설정 확인 실패")
+
+def get_binance_available_usdt() -> float:
+    api_key, api_secret = _bn_keys()
+    qs = urlencode({"timestamp": _now_ms(), "recvWindow": 5000})
+    url = f"https://fapi.binance.com/fapi/v2/balance?{qs}&signature=" + hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    r = requests.get(url, headers={"X-MBX-APIKEY": api_key}, timeout=10)
+    try:
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        log(f"[BINANCE 잔고 오류] {e.response.status_code} {e.response.text[:200]}")
+        raise
+    for a in r.json():
+        if a.get("asset") == "USDT":
+            try:
+                return float(a.get("availableBalance", "0"))
+            except Exception:
+                pass
     return 0.0
 
-def get_binance_futures_usdt_balance() -> Dict[str, float] | Dict[str, str]:
+def get_binance_position_qty() -> float:
+    api_key, api_secret = _bn_keys()
+    qs = urlencode({"timestamp": _now_ms(), "recvWindow": 5000})
+    url = f"https://fapi.binance.com/fapi/v2/positionRisk?{qs}&signature=" + hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+    r = requests.get(url, headers={"X-MBX-APIKEY": api_key}, timeout=10)
     try:
-        r = _bn_signed_get("/fapi/v2/balance")
-        if r.status_code != 200:
-            log(f"[잔고 조회 실패] {r.status_code}, {r.text[:200]}")
-            if '"code":-2015' in r.text:
-                global last_error
-                last_error = "binance_invalid_key_or_permission (-2015)"
-            return {"error": r.text}
-        balances = r.json()
-        usdt = next((x for x in balances if x.get("asset") == "USDT"), None)
-        if not usdt:
-            return {"error": "USDT balance not found"}
-        return {"total": float(usdt.get("balance", 0.0)), "available": float(usdt.get("availableBalance", 0.0))}
-    except Exception as e:
-        log(f"[잔고 조회 예외] {e}")
-        return {"error": str(e)}
+        r.raise_for_status()
+    except requests.HTTPError as e:
+        log(f"[BINANCE 포지션 오류] {e.response.status_code} {e.response.text[:200]}")
+        raise
+    for p in r.json():
+        if p["symbol"] == "BTCUSDT":
+            return float(p["positionAmt"])   # 숏이면 음수
+    return 0.0
 
-def binance_market_order_id(side: str, qty: float, reduce_only: bool=False) -> tuple[bool, Optional[int], str]:
+def binance_order(side: str, quantity: float, reduce_only: bool=False) -> Tuple[bool, Optional[int]]:
+    """
+    반환: (성공여부, orderId)
+    """
     try:
-        q = floor_step(qty, BINANCE_QTY_STEP)
-        if q <= 0:
-            return True, None, "qty<=0"
+        qty = floor_step(float(quantity), 0.001)
+        if qty <= 0:
+            return True, None
         params = {
-            "symbol": BINANCE_SYMBOL,
+            "symbol": "BTCUSDT",
             "side": "SELL" if side == "sell" else "BUY",
             "type": "MARKET",
-            "quantity": format(q, ".3f"),
-            "newOrderRespType": "RESULT",
+            "quantity": format(qty, ".3f"),
+            "reduceOnly": "true" if reduce_only else None
         }
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        r = _bn_signed_post("/fapi/v1/order", params)
-        log(f"[바이낸스 주문] {side.upper()} {params['quantity']} reduceOnly={reduce_only} → {r.status_code} {r.text[:200]}")
-        if r.status_code != 200 and ('"code":-2015' in r.text):
-            global last_error
-            last_error = "binance_invalid_key_or_permission (-2015)"
-        oid = None
+        url, headers = _bn_signed_url("/fapi/v1/order", params)
+        r = requests.post(url, headers=headers, timeout=10)
         try:
-            if r.status_code == 200:
-                oid = int(r.json().get("orderId"))
+            data = r.json()
         except Exception:
-            pass
-        return r.status_code == 200, oid, r.text
+            data = {"raw": r.text}
+        log(f"[바이낸스 주문] {side.upper()} qty={format(qty,'.3f')} reduceOnly={reduce_only} → {json.dumps(data, ensure_ascii=False)}")
+        r.raise_for_status()
+        if isinstance(data, dict) and "orderId" in data:
+            return True, int(data["orderId"])
+        return False, None
+    except requests.HTTPError as e:
+        log(f"[바이낸스 주문 오류] {e.response.status_code} {e.response.text[:200]}")
+        return False, None
     except Exception as e:
-        log(f"[바이낸스 주문 예외] {e}")
-        return False, None, str(e)
+        log(f"[바이낸스 주문 오류] {e}")
+        return False, None
 
-def binance_futures_get_fill(order_id: int) -> dict:
-    """해당 주문의 체결 리스트 합산 → avg/qty/fee(USDT)"""
-    try:
-        r = _bn_signed_get("/fapi/v1/userTrades", {"symbol": BINANCE_SYMBOL, "orderId": order_id})
-        if r.status_code != 200:
-            log(f"[fills 실패] {r.status_code} {r.text[:200]}")
-            return {"filled_qty": 0.0, "avg_price": 0.0, "fee_usdt": 0.0}
-        trades = r.json()
-        qty = 0.0; notional = 0.0; fee = 0.0
-        for t in trades:
-            q = float(t.get("qty", 0.0)); p = float(t.get("price", 0.0)); c = float(t.get("commission", 0.0))
-            qty += q; notional += q * p; fee += c
-        avg = (notional/qty) if qty>0 else 0.0
-        return {"filled_qty": qty, "avg_price": avg, "fee_usdt": fee}
-    except Exception as e:
-        log(f"[fills 예외] {e}")
-        return {"filled_qty": 0.0, "avg_price": 0.0, "fee_usdt": 0.0}
+def binance_user_trades(order_id: int) -> List[dict]:
+    params = {"symbol": "BTCUSDT", "orderId": order_id, "timestamp": _now_ms(), "recvWindow": 5000}
+    url, headers = _bn_signed_url("/fapi/v1/userTrades", params)
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200:
+        log(f"[바이낸스 체결 조회 오류] {r.status_code} {r.text[:200]}")
+        return []
+    return r.json()
 
-# =============== 시장 스냅샷/김프 ===============
-def get_market_snapshot() -> Dict[str, Any]:
-    try:
-        up = get_upbit_price(); bi = get_binance_price(); fx = get_usdkrw()
-        kimp = (up - bi * fx) / (bi * fx) * 100.0
-        return {"upbit_price": up, "binance_price": bi, "usdkrw": fx, "kimp": kimp}
-    except Exception as e:
-        return {"error": str(e)}
+def summarize_binance_order(order_id: int) -> Tuple[float, float, float]:
+    """
+    orderId 기준 체결 합산
+    반환: (총수량BTC, 체결가가중평균USDT, 수수료합USDT)
+    """
+    fills = binance_user_trades(order_id)
+    qty = 0.0
+    quote = 0.0
+    fee = 0.0
+    for f in fills:
+        q = float(f.get("qty", "0"))
+        p = float(f.get("price", "0"))
+        commission = float(f.get("commission", "0"))
+        qty += q
+        quote += q * p
+        fee += commission  # commissionAsset 보통 USDT
+    avg = (quote / qty) if qty > 0 else 0.0
+    return qty, avg, fee
 
-# =============== 손익 계산 ===============
-def compute_realized_pnl_krw(
-    qty: float,
-    ub_buy_avg: float, ub_sell_avg: float,
-    ub_fee_in_krw: float, ub_fee_out_krw: float,
-    bn_sell_avg: float, bn_buy_avg: float,
-    bn_fee_in_usdt: float, bn_fee_out_usdt: float,
-    usdkrw_exit: float, funding_usdt: float = 0.0
-) -> float:
-    # 업비트 현물
-    krw_in  = ub_buy_avg  * qty + ub_fee_in_krw
-    krw_out = ub_sell_avg * qty - ub_fee_out_krw
-    upbit_realized = krw_out - krw_in
-    # 바이낸스 선물(숏: 진입가-청산가)
-    usdt_pnl = (bn_sell_avg - bn_buy_avg) * qty
-    usdt_realized = usdt_pnl - (bn_fee_in_usdt + bn_fee_out_usdt + funding_usdt)
-    return upbit_realized + usdt_realized * usdkrw_exit
+def get_binance_size_usdt(mark_price: float | None = None) -> float:
+    if mark_price is None:
+        mark_price = get_binance_price()
+    qty = abs(get_binance_position_qty())
+    return round(qty * mark_price, 6)
 
-def compute_roi_pct_from_entry(entry_: dict, realized_krw: float) -> float:
-    if not entry_ or not entry_.get("krw_spent") or not entry_.get("usdkrw_entry"):
-        return 0.0
-    capital = entry_["krw_spent"] + (entry_["bn_notional_usdt"]/ max(1, entry_["lev"])) * entry_["usdkrw_entry"]
-    return (realized_krw / capital) * 100.0 if capital > 0 else 0.0
-
-# =============== 잔량 스윕/진입/청산 ===============
-def _sweep_all_residuals():
-    ub_btc = get_upbit_btc_balance()
-    if ub_btc > DUST_BTC:
-        upbit_market_sell_btc(ub_btc)
-    pos = get_binance_position_qty()
-    if pos > DUST_BTC:
-        binance_market_order_id("sell", pos, reduce_only=True)
-    elif pos < -DUST_BTC:
-        binance_market_order_id("buy", -pos, reduce_only=True)
-
-def must_enter(amount_krw: float, poll_sec: float=0.5, leverage:int=3, tol_usdt:float=5.0) -> Tuple[float, float]:
-    snap = get_market_snapshot()
-    if "error" in snap:
-        log(f"[진입 중단] 스냅샷 오류: {snap['error']}")
-        return 0.0, 0.0
-    up = snap["upbit_price"]; bi = snap["binance_price"]; fx = snap["usdkrw"]
-    kimp_now = (up - bi * fx) / (bi * fx) * 100.0
-
-    target_size_usdt = amount_krw / fx
-    need_margin_usdt = target_size_usdt / max(1, leverage)
-
-    bal = get_binance_futures_usdt_balance()
-    if isinstance(bal, dict) and "available" in bal:
-        if float(bal["available"]) + 1e-6 < need_margin_usdt:
-            log(f"[진입 중단] 가용USDT 부족")
-            return 0.0, 0.0
-
-    # 업비트 매수 (uuid 확보)
-    ok_u, got, _, ub_uuid = upbit_market_buy_by_krw(amount_krw)
-    if not ok_u or got <= 0:
-        log("[진입 실패] 업비트 체결 실패")
-        return 0.0, 0.0
-    ub_fill = upbit_get_fill(ub_uuid)
-    upbit_qty = floor_step(ub_fill["filled_qty"], UPBIT_QTY_STEP)
-    if upbit_qty <= 0:
-        log("[진입 실패] 업비트 수량 0")
-        return 0.0, 0.0
-
-    # 바이낸스 숏
-    target_qty = floor_step(target_size_usdt / bi, BINANCE_QTY_STEP)
-    ok_b, oid, _ = binance_market_order_id("sell", target_qty, reduce_only=False)
-    if not ok_b or not oid:
-        log("[진입 실패] 바이낸스 주문 실패 → 업비트 보상매도")
-        upbit_market_sell_btc(upbit_qty)
-        return 0.0, 0.0
-    bn_fill = binance_futures_get_fill(oid)
-
-    # 명목 USDT 보정 루프
-    for _ in range(12):
-        pos = abs(get_binance_position_qty()); cur_usdt = pos * bi
-        diff = target_size_usdt - cur_usdt
+def adjust_binance_size_to_target(target_size_usdt: float, ref_price: float, tol_usdt: float = 5.0) -> None:
+    def cur_size():
+        qty = abs(get_binance_position_qty())
+        return qty * ref_price
+    for _ in range(4):
+        now = cur_size()
+        diff = target_size_usdt - now
         if abs(diff) <= tol_usdt:
-            break
-        adj_qty = floor_step(abs(diff)/bi, BINANCE_QTY_STEP)
-        if adj_qty <= 0:
-            break
+            log(f"[사이즈 OK] 목표 {round(target_size_usdt,2)}USDT, 현재 {round(now,2)}USDT (±{tol_usdt})")
+            return
+        qty = floor_step(abs(diff) / ref_price, 0.001)
+        if qty <= 0:
+            return
         if diff > 0:
-            ok_b2, oid2, _ = binance_market_order_id("sell", adj_qty, reduce_only=False)
+            ok, oid = binance_order("sell", qty, reduce_only=False)
+            if oid: current_cycle["binance_sell_id"] = oid  # 증분도 마지막 oid 보관
+            log(f"[보정] 모자람 {round(diff,2)}USDT → 추가 SELL {qty} BTC")
         else:
-            ok_b2, oid2, _ = binance_market_order_id("buy", adj_qty, reduce_only=True)
-        if ok_b2 and oid2:
-            f2 = binance_futures_get_fill(oid2)
-            tot_q = bn_fill["filled_qty"] + f2["filled_qty"]
-            if tot_q > 0:
-                bn_fill["avg_price"] = (bn_fill["avg_price"]*bn_fill["filled_qty"] + f2["avg_price"]*f2["filled_qty"]) / tot_q
-                bn_fill["filled_qty"] = tot_q
-                bn_fill["fee_usdt"] += f2["fee_usdt"]
-        time.sleep(poll_sec)
+            ok, oid = binance_order("buy", qty, reduce_only=True)
+            if oid: current_cycle["binance_buy_id"] = oid
+            log(f"[보정] 초과 {round(-diff,2)}USDT → BUY(RO) {qty} BTC")
+        time.sleep(0.4)
 
-    q = min(upbit_qty, floor_step(abs(get_binance_position_qty()), BINANCE_QTY_STEP))
-    if q <= 0:
-        log("[진입 실패] 양다리 수량 불일치 → 보상거래")
-        upbit_market_sell_btc(upbit_qty)
-        return 0.0, 0.0
+# --------- 전량 청산 루틴 ----------
+def full_exit_with_retries(max_retries: int = 6, retry_delay: float = 1.2) -> Tuple[bool, Optional[str], Optional[int]]:
+    """
+    반환: (완료여부, upbit_sell_uuid, binance_buy_orderId)
+    """
+    up_uuid = None
+    bn_oid = None
+    for attempt in range(1, max_retries + 1):
+        raw_up = get_upbit_btc_balance()
+        upbit_bal = 0.0 if raw_up <= DUST_BTC else floor_step(raw_up, UPBIT_BTC_STEP)
+        pos_amt   = get_binance_position_qty()     # 숏이면 음수
+        need_up   = upbit_bal >= UPBIT_BTC_STEP
+        need_bin  = pos_amt < -1e-6
 
-    # 엔트리 스냅샷
-    with state_lock:
-        entry.update({
-            "ts": time.time(),
-            "qty": q,
-            "ub_avg": ub_fill["avg_price"],
-            "ub_fee_krw": ub_fill["fee_krw"],
-            "bn_avg": bn_fill["avg_price"],
-            "bn_fee_usdt": bn_fill["fee_usdt"],
-            "usdkrw_entry": fx,
-            "kimp_entry": kimp_now,
-            "krw_spent": ub_fill["avg_price"]*q + ub_fill["fee_krw"],
-            "bn_notional_usdt": bn_fill["avg_price"]*q,
-            "lev": leverage
-        })
-    return upbit_qty, floor_step(abs(get_binance_position_qty()), BINANCE_QTY_STEP)
+        log(f"[청산 체크#{attempt}] upbit={raw_up:.8f}->{upbit_bal:.8f} BTC, binance_pos={pos_amt}")
 
-def must_exit(poll_sec: float=0.5):
-    global profit_krw, last_realized_krw, last_roi_pct
+        ok_u = True
+        if need_up:
+            ok_u, up_uuid = upbit_order("sell", 0, upbit_bal)
+            if ok_u and up_uuid:
+                current_cycle["upbit_sell_uuid"] = up_uuid
 
-    q = float(entry.get("qty", 0.0) or 0.0)
-    if q <= 0:
-        _sweep_all_residuals()
-        return
+        ok_b = True
+        if need_bin:
+            ok_b, bn_oid = binance_order("buy", abs(pos_amt), reduce_only=True)
+            if ok_b and bn_oid:
+                current_cycle["binance_buy_id"] = bn_oid
 
-    # 바이낸스 숏 청산(BUY reduceOnly)
-    ok_b, oid_b, _ = binance_market_order_id("buy", q, reduce_only=True)
-    time.sleep(poll_sec)
-    bn_out = binance_futures_get_fill(oid_b) if (ok_b and oid_b) else {"avg_price": 0.0, "fee_usdt": 0.0}
+        time.sleep(retry_delay)
 
-    # 업비트 전량 매도
-    ok_u, _, ub_uuid = upbit_market_sell_btc(q)
-    time.sleep(poll_sec)
-    ub_out = upbit_get_fill(ub_uuid) if (ok_u and ub_uuid) else {"avg_price": 0.0, "fee_krw": 0.0}
+        raw_up2 = get_upbit_btc_balance()
+        up2 = 0.0 if raw_up2 <= DUST_BTC else floor_step(raw_up2, UPBIT_BTC_STEP)
+        pos2 = get_binance_position_qty()
+        closed = (up2 < UPBIT_BTC_STEP) and (-1e-6 <= pos2 <= 1e-6)
 
-    # 잔량 스윕
-    for _ in range(20):
-        _sweep_all_residuals()
-        time.sleep(poll_sec/2)
-        if get_upbit_btc_balance() < 1e-6 and abs(get_binance_position_qty()) < 1e-6:
+        log(f"[청산 재확인#{attempt}] upbit={raw_up2:.8f}->{up2:.8f}, binance_pos={pos2}, result={'OK' if closed else 'RETRY'}")
+
+        if ok_u and ok_b and closed:
+            return True, up_uuid, bn_oid
+    return False, up_uuid, bn_oid
+
+# ------------------ PnL 계산 ------------------
+def compute_cycle_pnl_and_log(amount_krw: float, fx_for_exit: float) -> float:
+    """
+    현재 current_cycle에 저장된 체결정보로 정확 손익 계산 및 로그
+    반환: 총 손익(KRW)
+    """
+    # 업비트 측 체결 요약(있으면 갱신)
+    if current_cycle["upbit_buy_uuid"]:
+        krw, qty, fee = summarize_upbit_order(current_cycle["upbit_buy_uuid"])
+        current_cycle["upbit_buy_krw"] = krw
+        current_cycle["upbit_fee_krw"] += fee
+        entry_info["upbit_qty"] = qty
+
+    if current_cycle["upbit_sell_uuid"]:
+        krw, qty, fee = summarize_upbit_order(current_cycle["upbit_sell_uuid"])
+        current_cycle["upbit_sell_krw"] = krw
+        current_cycle["upbit_fee_krw"] += fee
+
+    upbit_pnl = (current_cycle["upbit_sell_krw"] - current_cycle["upbit_buy_krw"] - current_cycle["upbit_fee_krw"])
+
+    # 바이낸스 측 체결 요약
+    if current_cycle["binance_sell_id"]:
+        qty, avg, fee = summarize_binance_order(current_cycle["binance_sell_id"])
+        current_cycle["binance_entry_qty"] = qty
+        current_cycle["binance_entry_avg"] = avg
+        current_cycle["binance_fee_usdt"] += fee
+        entry_info["binance_qty"] = qty
+
+    if current_cycle["binance_buy_id"]:
+        qty, avg, fee = summarize_binance_order(current_cycle["binance_buy_id"])
+        current_cycle["binance_exit_qty"] = qty
+        current_cycle["binance_exit_avg"] = avg
+        current_cycle["binance_fee_usdt"] += fee
+
+    # 선물 실현손익(USDT): 숏 → (입가격 - 출가격) * 수량 - 수수료
+    qty_close = min(current_cycle["binance_entry_qty"], current_cycle["binance_exit_qty"])
+    fut_pnl_usdt = (current_cycle["binance_entry_avg"] - current_cycle["binance_exit_avg"]) * qty_close - current_cycle["binance_fee_usdt"]
+
+    total_pnl_krw = upbit_pnl + fut_pnl_usdt * fx_for_exit
+
+    # 수익률(%)
+    ret_pct = (total_pnl_krw / amount_krw * 100.0) if amount_krw > 0 else 0.0
+
+    log(f"[실현손익] {ret_pct:+.2f}% | {int(round(total_pnl_krw)):+,} KRW "
+        f"(Upbit {int(round(upbit_pnl)):+,} KRW, Binance {fut_pnl_usdt:+.3f} USDT @ FX={fx_for_exit:.2f})")
+
+    return total_pnl_krw
+
+def reset_cycle():
+    for k in list(current_cycle.keys()):
+        if isinstance(current_cycle[k], (int, float)):
+            current_cycle[k] = 0 if isinstance(current_cycle[k], int) else 0.0
+        else:
+            current_cycle[k] = None
+
+# ------------------ 프리체크 & 동시 진입(무롤백) ------------------
+def can_enter_now(amount_krw: float, leverage: int, fx: float, bi_price: float, margin_buffer: float = 1.02) -> Tuple[bool, str, Dict[str, float]]:
+    """
+    진입 전에 둘 다 '거의 확실히' 가능한지 확인
+    margin_buffer: 증거금 여유(예: +2%)
+    """
+    info: Dict[str, float] = {}
+    # 업비트 KRW 체크
+    try:
+        krw_bal = get_upbit_krw_balance()
+    except Exception:
+        return False, "업비트 잔고 조회 실패(키/권한/IP 확인)", info
+
+    if krw_bal < amount_krw:
+        return False, f"업비트 KRW 부족 {int(krw_bal):,} < {int(amount_krw):,}", info
+
+    # 바이낸스 마진 체크
+    try:
+        target_size_usdt = amount_krw / fx
+        need_margin = (target_size_usdt / leverage) * margin_buffer
+        avail_usdt = get_binance_available_usdt()
+    except Exception:
+        return False, "바이낸스 증거금 조회 실패(키/권한/IP/시간 확인)", info
+
+    info.update(target_size_usdt=target_size_usdt, need_margin=need_margin, avail_usdt=avail_usdt)
+    if avail_usdt + 1e-6 < need_margin:
+        return False, f"바이낸스 증거금 부족 {avail_usdt:.2f} < {need_margin:.2f}", info
+    return True, "OK", info
+
+def enter_both_sides_once_no_rollback(
+    amount_krw: float,
+    fx: float,
+    bi_price: float,
+    leverage: int = 3,
+    retries: int = 3,
+    wait_sec: float = 0.4,
+    confirm_timeout_sec: float = 3.0
+) -> tuple[bool, Optional[str], Optional[int], float]:
+    """
+    - 업비트 금액시장가와 바이낸스 수량시장가를 동시에 발사
+    - 실패한 쪽만 짧게 재시도(retries)
+    - 롤백은 절대 하지 않음
+    - 제한 시간 안에 양쪽 '실측' 보유/포지션이 확인되면 성공으로 간주
+    반환: (성공여부, upbit_uuid, binance_orderId, 최초바낸수량)
+    """
+    up_uuid = None
+    bn_oid  = None
+    ok_u = False
+    ok_b = False
+
+    # 초기 수량을 살짝 작게(-0.1%) 잡아 증거금/가격 튐 대비
+    target_size_usdt = amount_krw / fx
+    init_qty = floor_step((target_size_usdt * 0.999) / bi_price, 0.001)
+    if init_qty <= 0:
+        log("[진입 중단] 계산된 초기 수량이 0")
+        return False, None, None, 0.0
+
+    # 1) 동시 발사
+    def fire_upbit():
+        nonlocal ok_u, up_uuid
+        ok, u = upbit_order("buy", amount_krw, 0.0)
+        ok_u = ok
+        if ok and u:
+            up_uuid = u
+
+    def fire_binance():
+        nonlocal ok_b, bn_oid
+        ok, oid = binance_order("sell", init_qty, reduce_only=False)
+        ok_b = ok
+        if ok and oid:
+            bn_oid = oid
+
+    t1 = threading.Thread(target=fire_upbit); t2 = threading.Thread(target=fire_binance)
+    t1.start(); t2.start()
+    t1.join(timeout=2.0); t2.join(timeout=2.0)
+
+    # 2) 실패한 쪽만 짧게 재시도
+    for _ in range(retries):
+        if not ok_u:
+            time.sleep(wait_sec)
+            ok, u = upbit_order("buy", amount_krw, 0.0)
+            ok_u = ok or ok_u
+            if ok and u: up_uuid = u
+        if not ok_b:
+            time.sleep(wait_sec)
+            ok, oid = binance_order("sell", init_qty, reduce_only=False)
+            ok_b = ok or ok_b
+            if ok and oid: bn_oid = oid
+        if ok_u and ok_b:
             break
 
-    # 실현손익 계산
-    usdkrw_exit = get_usdkrw()
-    realized = compute_realized_pnl_krw(
-        qty=q,
-        ub_buy_avg=entry["ub_avg"], ub_sell_avg=ub_out["avg_price"],
-        ub_fee_in_krw=entry["ub_fee_krw"], ub_fee_out_krw=ub_out["fee_krw"],
-        bn_sell_avg=entry["bn_avg"], bn_buy_avg=bn_out["avg_price"],
-        bn_fee_in_usdt=entry["bn_fee_usdt"], bn_fee_out_usdt=bn_out["fee_usdt"],
-        usdkrw_exit=usdkrw_exit, funding_usdt=0.0
-    )
-    with state_lock:
-        profit_krw += realized
-        last_realized_krw = realized
-        last_roi_pct = compute_roi_pct_from_entry(entry, realized)
-        entry.clear()
+    # 3) 바이낸스 명목가치 보정
+    if ok_b:
+        time.sleep(0.5)
+        adjust_binance_size_to_target(target_size_usdt, ref_price=bi_price, tol_usdt=5.0)
 
-# =============== 전략 루프 ===============
+    # 4) 제한 시간 안에 양쪽 실측 확인
+    t_end = time.time() + confirm_timeout_sec
+    entered = False
+    while time.time() < t_end:
+        try:
+            ub_qty = get_upbit_btc_balance()
+            bn_qty = abs(get_binance_position_qty())
+        except Exception:
+            ub_qty = 0.0; bn_qty = 0.0
+        if ub_qty >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+            entered = True
+            break
+        time.sleep(0.25)
+
+    if entered:
+        log("[진입 확정] 롤백 없이 양쪽 체결 확인")
+        return True, up_uuid, bn_oid, init_qty
+    else:
+        log("[경고] 부분 체결 상태 유지(롤백 비활성). 다음 루프에서 계속 보정")
+        return False, up_uuid, bn_oid, init_qty
+
+# ------------------ 프리플라이트 ------------------
+def preflight() -> Dict[str, Any]:
+    out = {"ok": False, "upbit": {}, "binance": {}}
+    # Upbit
+    try:
+        krw = get_upbit_krw_balance()
+        btc = get_upbit_btc_balance()
+        out["upbit"] = {"ok": True, "krw": krw, "btc": btc}
+    except Exception as e:
+        out["upbit"] = {"ok": False, "msg": str(e)}
+
+    # Binance
+    try:
+        sync_binance_time()
+        usdt = get_binance_available_usdt()
+        lev  = get_binance_leverage("BTCUSDT")
+        out["binance"] = {"ok": True, "usdt_avail": usdt, "leverage": lev}
+    except Exception as e:
+        out["binance"] = {"ok": False, "msg": str(e)}
+
+    out["ok"] = bool(out["upbit"].get("ok") and out["binance"].get("ok"))
+    return out
+
+# ------------------ main loop ------------------
 def run_strategy_thread(config: Dict[str, Any]) -> None:
     global running, position_state, trade_count, profit_krw, total_pnl
-    global entry_info, entry_kimp_value, last_error
-    global current_position, last_position
+    global entry_info, entry_kimp_value, last_exit_ts, exiting
 
-    target_kimp = float(config['target_kimp'])
-    exit_kimp   = float(config['exit_kimp'])
+    target_kimp = float(config['target_kimp'])  # 예: -0.8
+    exit_kimp   = float(config['exit_kimp'])    # 예: -0.5
     tolerance   = float(config['tolerance'])
-    amount_krw  = float(config['amount_krw'])
+    amount_krw  = float(config['amount_krw'])   # 업비트 투입 KRW, 바이낸스 notional 동일
+    leverage    = int(config.get("leverage", 3))
 
-    exit_on_sign_change: bool = bool(config.get('exit_on_sign_change', True))
-    exit_on_move_bp: float = float(config.get('exit_on_move_bp', 0.0))  # 엔트리 대비 n bp(%) 이상
-    sticky_display: bool = bool(config.get('sticky_display', True))
-
-    # Binance 준비
-    sync_binance_server_time()
-    ensure_one_way_mode()
-    set_margin_mode(BINANCE_SYMBOL, isolated=True)
-    set_binance_leverage(BINANCE_SYMBOL, 3)  # 3배(수량엔 영향 없음)
+    ensure_binance_margin_and_leverage("BTCUSDT", leverage)
 
     while running:
         try:
-            _ = get_binance_futures_usdt_balance()  # 표시용 갱신
+            # >>> 캐시에서 초고속 스냅샷 읽기
+            kimp_view, up, bi, fx = get_market_snapshot()
+            kimp_exact = calc_kimp(up, bi, fx)   # 비교는 정밀값
+            kimp = kimp_exact
+            # 상태 보정
+            try:
+                if position_state == "entered":
+                    if get_upbit_btc_balance() < UPBIT_BTC_STEP and abs(get_binance_position_qty()) < 1e-6:
+                        position_state = "neutral"
+                        entry_info["upbit_qty"] = 0.0
+                        entry_info["binance_qty"] = 0.0
+                        entry_kimp_value = None
+                        log("[상태 보정] 실측 0/0 → neutral")
+            except Exception:
+                pass
 
-            snap = get_market_snapshot()
-            if "error" in snap:
-                last_error = snap["error"]
-                time.sleep(1); continue
-
-            up = snap["upbit_price"]; bi = snap["binance_price"]; fx = snap["usdkrw"]
-            kimp = (up - bi * fx) / (bi * fx) * 100.0
-            kimp_view = round(kimp, 2)
-            last_error = None
-
+            # ENTRY
             if position_state == "neutral":
                 dir_ok  = (kimp <= target_kimp) if target_kimp < 0 else (kimp >= target_kimp)
-                near_ok = abs(kimp - target_kimp) <= tolerance
-                if dir_ok and near_ok:
-                    uq, bq = must_enter(amount_krw, poll_sec=0.5, leverage=3, tol_usdt=5.0)
-                    if uq > 0 and bq > 0:
-                        entry_info["upbit_qty"] = uq
-                        entry_info["binance_qty"] = bq
+                near_ok = (abs(kimp - target_kimp) <= tolerance)
+                cool_ok = (time.time() - last_exit_ts) > EXIT_COOLDOWN_SEC
+
+                log(f"[체크] kimp={kimp_view:.2f}% target={target_kimp} tol={tolerance} dir_ok={dir_ok} near_ok={near_ok} cool_ok={cool_ok} state={position_state}")
+
+                if dir_ok and near_ok and cool_ok:
+                    reset_cycle()  # 새 사이클 시작
+
+                    # 사전 게이트(잔고/증거금 여유 확인)
+                    ok_gate, msg, info = can_enter_now(amount_krw, leverage, fx, bi, margin_buffer=1.02)
+                    if not ok_gate:
+                        log(f"[진입 중단] {msg}")
+                        time.sleep(0.6)
+                        continue
+
+                    log(f"[프리체크 OK] 목표≈{info['target_size_usdt']:.2f}USDT 필요증거금≈{info['need_margin']:.2f} 가용≈{info['avail_usdt']:.2f}")
+
+                    # 동시 진입(무롤백) + 실패쪽만 짧게 재시도
+                    ok_enter, u_uuid, b_oid, init_qty = enter_both_sides_once_no_rollback(
+                        amount_krw, fx, bi, leverage=leverage, retries=3, wait_sec=0.4, confirm_timeout_sec=3.0
+                    )
+                    if u_uuid: current_cycle["upbit_buy_uuid"] = u_uuid
+                    if b_oid:  current_cycle["binance_sell_id"] = b_oid
+
+                    if not ok_enter:
+                        time.sleep(0.6)
+                        try:
+                            ub_qty = get_upbit_btc_balance()
+                            bn_qty = abs(get_binance_position_qty())
+                        except Exception:
+                            ub_qty = 0.0; bn_qty = 0.0
+                        if ub_qty >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+                            entry_info["upbit_qty"] = floor_step(ub_qty, UPBIT_BTC_STEP)
+                            entry_info["binance_qty"] = floor_step(bn_qty, 0.001)
+                            position_state = "entered"
+                            entry_kimp_value = round(kimp, 4)
+                            log("[진입 확정] 부분 체결 → 다음 루프에서 완성 확인")
+                        continue
+
+                    # 진입 성공 시, 명목가치 정밀 보정
+                    time.sleep(0.5)
+                    target_size_usdt = amount_krw / fx
+                    adjust_binance_size_to_target(target_size_usdt, ref_price=bi, tol_usdt=5.0)
+
+                    # 최종 실측으로 상태 확정
+                    try:
+                        ub_qty = get_upbit_btc_balance()
+                        bn_qty = abs(get_binance_position_qty())
+                    except Exception:
+                        ub_qty = 0.0; bn_qty = 0.0
+                    if ub_qty >= UPBIT_BTC_STEP and bn_qty > 1e-6:
+                        entry_info["upbit_qty"] = floor_step(ub_qty, UPBIT_BTC_STEP)
+                        entry_info["binance_qty"] = floor_step(bn_qty, 0.001)
                         position_state = "entered"
                         entry_kimp_value = round(kimp, 4)
-                        current_position = {
-                            "live": True,
-                            "side": "LS",  # Upbit LONG + Binance SHORT
-                            "upbit_qty": uq,
-                            "binance_qty": bq,
-                            "entry_kimp": entry_kimp_value,
-                            "entered_at": time.time(),
-                        }
-                        log(f"[진입 완료] 업비트 +{uq}BTC / 바이낸스 -{bq}BTC @ {kimp_view}% (명목≈{amount_krw:.0f}KRW)")
+                        log(f"[진입 확정] 업비트 +{entry_info['upbit_qty']}BTC(≈{int(amount_krw)}KRW) / "
+                            f"바이낸스 숏 ≈{round(target_size_usdt,2)}USDT (x{leverage}) @ 김프 {kimp_view:.2f}%")
                     else:
-                        last_error = last_error or "binance_enter_failed"
+                        log(f"[진입 미완성] ub={ub_qty:.6f} BTC, bn={bn_qty:.6f} BTC — 다음 루프에서 보정")
 
+            # EXIT
             elif position_state == "entered":
+                if exiting:
+                    time.sleep(0.3)
+                    continue
+
+                # 청산 직전 재계산 (캐시 스냅샷)
+                kimp_now_view, up2, bi2, fx2 = get_market_snapshot()
+                kimp_now = calc_kimp(up2, bi2, fx2)
+
+                crossed = False
                 if entry_kimp_value is not None:
-                    crossed_exit = (kimp >= exit_kimp) if exit_kimp >= entry_kimp_value else (kimp <= exit_kimp)
-                else:
-                    crossed_exit = False
+                    crossed = (kimp_now >= exit_kimp) if exit_kimp >= entry_kimp_value else (kimp_now <= exit_kimp)
 
-                sign_change = False
-                if exit_on_sign_change and entry_kimp_value is not None:
-                    sign_change = (entry_kimp_value >= 0 and kimp < 0) or (entry_kimp_value < 0 and kimp >= 0)
+                if crossed:
+                    log(f"[청산 트리거] entry={entry_kimp_value}, exit_target={exit_kimp}, kimp_now={kimp_now_view:.2f}%")
+                    exiting = True
+                    try:
+                        done, up_uuid, bn_oid = full_exit_with_retries(max_retries=6, retry_delay=1.2)
+                        if done:
+                            trade_count += 1
+                            position_state = "neutral"
+                            if up_uuid: current_cycle["upbit_sell_uuid"] = up_uuid
+                            if bn_oid:  current_cycle["binance_buy_id"] = bn_oid
 
-                move_trigger = False
-                if exit_on_move_bp > 0 and entry_kimp_value is not None:
-                    move_trigger = abs(kimp - entry_kimp_value) >= exit_on_move_bp
+                            # === 실현손익 계산 & 로그 ===
+                            pnl_krw = compute_cycle_pnl_and_log(amount_krw=amount_krw, fx_for_exit=fx2)
+                            profit_krw += pnl_krw
 
-                if crossed_exit or sign_change or move_trigger:
-                    why = "exit_kimp" if crossed_exit else ("sign_change" if sign_change else "move_trigger")
-                    log(f"[청산 트리거:{why}] entry={entry_kimp_value}, exit={exit_kimp}, 현재={kimp_view}%")
+                            delta = 0.0 if entry_kimp_value is None else round(abs(exit_kimp - entry_kimp_value), 3)
+                            log(f"[청산 성공] 김프 {kimp_now_view:.2f}% (진입 {entry_kimp_value} → 청산선 {exit_kimp}, Δ≈{delta}%)")
 
-                    must_exit()
-                    trade_count += 1
-
-                    if sticky_display and current_position:
-                        current_position.update({
-                            "live": False,
-                            "closed_at": time.time(),
-                            "close_kimp": round(kimp, 4),
-                            "realized_krw": round(last_realized_krw),
-                            "roi_last_pct": round(last_roi_pct, 3)
-                        })
-                        last_position = current_position.copy()
-                    else:
-                        last_position = None
-
-                    position_state = "neutral"
-                    entry_info.update({"upbit_qty":0.0,"binance_qty":0.0})
-                    entry_kimp_value = None
-                    current_position = None
-                    log(f"[청산 완료] 실현손익={round(last_realized_krw)} KRW, ROI={round(last_roi_pct,3)}%")
+                            # 상태/사이클 리셋
+                            entry_kimp_value = None
+                            entry_info["upbit_qty"] = 0.0
+                            entry_info["binance_qty"] = 0.0
+                            last_exit_ts = time.time()
+                            reset_cycle()
+                        else:
+                            log("[청산 미완료] 잔량 남음. 루프 재시도")
+                    finally:
+                        exiting = False
 
         except Exception as e:
-            last_error = str(e)
             log(f"[에러] {e}")
 
-        time.sleep(0.6)
+        time.sleep(1)
 
-# =============== 외부 인터페이스 ===============
 def start_strategy(config: Dict[str, Any]) -> None:
-    global running, last_error
+    """
+    전략 시작: 프리플라이트(키/권한/IP/시간) 통과해야 시작
+    """
+    global running
     if running:
+        log("[전략 시작] 이미 실행 중")
         return
-    # 키 검증
-    bk, bs = _binance_keys()
-    if not bk or not bs:
-        last_error = "binance_api_key_missing"
-        log("[시작실패] BINANCE_API_KEY/SECRET 비어있음 (.env 또는 api_key 로드 확인)")
+
+    ensure_market_updater()
+    sync_binance_time()
+
+    pf = preflight()
+    if not pf["ok"]:
+        log(f"[시작 실패] 프리플라이트 오류: {json.dumps(pf, ensure_ascii=False)}")
         return
+    else:
+        log(f"[프리플라이트 OK] {json.dumps(pf, ensure_ascii=False)}")
+
     running = True
     threading.Thread(target=run_strategy_thread, args=(config,), daemon=True).start()
-    log(f"[전략 시작] testnet={BINANCE_TESTNET}, base={BASE_FAPI}")
+    log("[전략 시작]")
 
 def stop_strategy() -> None:
-    global running, entry_kimp_value
+    global running, entry_kimp_value, exiting
     running = False
     entry_kimp_value = None
+    exiting = False
     log("[전략 중지]")
 
-def force_exit_now() -> None:
-    try:
-        must_exit()
-        log("[수동 청산] 완료")
-    except Exception as e:
-        log(f"[수동 청산 오류] {e}")
-
 def get_strategy_status() -> Dict[str, Any]:
-    snap = get_market_snapshot()
-    binance_bal = get_binance_futures_usdt_balance()
-    display_position = current_position if current_position is not None else last_position
-    display_is_live = bool(display_position and display_position.get("live", False))
-
-    # total_pnl은 확장 전까지 profit_krw로 동일 노출 가능
     return {
         "running": running,
         "position_state": position_state,
         "profit_krw": round(profit_krw),
-        "total_pnl": round(profit_krw),
+        "total_pnl": total_pnl,
         "trade_count": trade_count,
-        "entry_kimp_value": entry_kimp_value,
-        "entry_info": entry_info,
-        "last_error": last_error,
-        "snapshot": snap,
-        "balances": {"binance_futures_usdt": binance_bal},
-        "current_position": current_position,
-        "last_position": last_position,
-        "display_position": display_position,
-        "display_is_live": display_is_live,
-        "last_realized_krw": round(last_realized_krw),
-        "roi_last_pct": round(last_roi_pct, 3),
-        "logs": logs[-250:],
+        "logs": logs,
+        "entry_info": entry_info
     }
 
-__all__ = [
-    "start_strategy", "stop_strategy", "get_strategy_status",
-    "get_market_snapshot", "force_exit_now"
-]
+__all__ = ["start_strategy", "stop_strategy", "get_strategy_status", "preflight"]
