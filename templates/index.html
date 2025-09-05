@@ -88,6 +88,9 @@
     .circle small{display:block; font-size:10px; color:#9db0d0}
     .circle strong{font-size:12px}
   </style>
+
+  <!-- 업비트 WebSocket 응답(MessagePack) 디코딩용 -->
+  <script src="https://unpkg.com/@msgpack/msgpack/dist/msgpack.min.js"></script>
 </head>
 <body>
 <header>
@@ -458,7 +461,6 @@
       const bands = Array.isArray(s?.bands) ? s.bands : [];
       if (!bands.length){ el.textContent = '-'; return; }
 
-      // ★ 수정: 최신 바이낸스 선물가격은 tickLight()가 갱신한 lastBinance 사용
       const bp = Number.isFinite(lastBinance) ? lastBinance : NaN;
       if (!Number.isFinite(bp) || bp <= 0){ el.textContent = '-'; return; }
 
@@ -500,7 +502,7 @@
         else{ sign.textContent = (kimp>=0 ? '프리미엄(+)' : '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
       }else{ sign.textContent='-'; sign.className='badge'; }
 
-      // ★ 추가: 가격이 갱신될 때도 증거금을 즉시 재계산
+      // 최신 상태가 있으면 증거금도 재계산
       if (window.__lastStatus) updateUsedMarginFromStatus(window.__lastStatus);
 
       Array.from(document.querySelectorAll('#band-tbody tr')).forEach(updatePreviewForRow);
@@ -510,7 +512,6 @@
   async function renderServerBands(){
     try{
       const s = await fetchJson('/status');
-      // ★ 추가: 최신 상태를 저장해 tickLight()에서 사용
       window.__lastStatus = s;
 
       const list = Array.isArray(s.bands) ? s.bands : [];
@@ -564,7 +565,6 @@
       if (runDot) runDot.className = 'dot ' + (run?'ok':'danger');
       $('#run-badge span:last-child').textContent = run ? '실행중' : '중지';
 
-      // ← 진입 증거금(USDT) 표시 업데이트
       updateUsedMarginFromStatus(s);
     }catch(e){ onError(e); }
   }
@@ -591,6 +591,79 @@
       $('#metric-errors').textContent = m.api_errors ?? '-';
     }catch(e){ onError(e); }
   }
+
+  // ====== 실시간 김프를 위한 WebSocket 추가 (다른 로직은 변경 없음) ======
+  let upbitWS = null, binanceWS = null;
+
+  function updateKimpAndUIFromTicks() {
+    if (!Number.isFinite(lastUpbit) || !Number.isFinite(lastBinance) || !Number.isFinite(lastUsdkrw)) return;
+    const kimp = ((lastUpbit - lastBinance * lastUsdkrw) / (lastBinance * lastUsdkrw)) * 100.0;
+
+    $('#kimp').textContent = fx(kimp, 2);
+    $('#upbit_price').textContent = loc(lastUpbit);
+    $('#binance_price').textContent = fx(lastBinance, 2);
+
+    const sign = $('#kimp-sign');
+    if (Math.abs(kimp) < 0.01) { sign.textContent = '중립'; sign.className = 'badge'; }
+    else { sign.textContent = (kimp>=0 ? '프리미엄(+)' : '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
+
+    $('#kimp-brief').textContent = `김프 ${fx(kimp,2)}% · 업비트 ${loc(lastUpbit)} KRW · 바이낸스 ${fx(lastBinance,2)} USDT · 환율 ${fx(lastUsdkrw,2)}`;
+
+    sparkData.push(kimp);
+    if (sparkData.length > SPARK_MAX_POINTS) sparkData.shift();
+    drawSpark();
+
+    // 실시간 가격 반영 시 증거금 갱신
+    if (window.__lastStatus) updateUsedMarginFromStatus(window.__lastStatus);
+  }
+
+  function connectUpbitWS() {
+    try { upbitWS && upbitWS.close(); } catch {}
+    upbitWS = new WebSocket('wss://api.upbit.com/websocket/v1');
+    upbitWS.binaryType = 'arraybuffer';
+    upbitWS.onopen = () => {
+      const msg = [
+        { ticket: 'kimp-dashboard' },
+        { type: 'ticker', codes: ['KRW-BTC'] }
+      ];
+      upbitWS.send(JSON.stringify(msg));
+    };
+    upbitWS.onmessage = (ev) => {
+      try {
+        const data = msgpack.decode(new Uint8Array(ev.data));
+        const p = Number(data?.trade_price);
+        if (Number.isFinite(p) && p > 0) {
+          lastUpbit = p;
+          updateKimpAndUIFromTicks();
+        }
+      } catch(_){}
+    };
+    upbitWS.onclose = () => setTimeout(connectUpbitWS, 1500);
+    upbitWS.onerror = () => { try { upbitWS.close(); } catch {} };
+  }
+
+  function connectBinanceWS() {
+    try { binanceWS && binanceWS.close(); } catch {}
+    binanceWS = new WebSocket('wss://fstream.binance.com/ws/btcusdt@aggTrade');
+    binanceWS.onmessage = (ev) => {
+      try {
+        const j = JSON.parse(ev.data);
+        const p = Number(j?.p);
+        if (Number.isFinite(p) && p > 0) {
+          lastBinance = p;
+          updateKimpAndUIFromTicks();
+        }
+      } catch(_){}
+    };
+    binanceWS.onclose = () => setTimeout(connectBinanceWS, 1500);
+    binanceWS.onerror = () => { try { binanceWS.close(); } catch {} };
+  }
+
+  function startRealtime() {
+    connectUpbitWS();
+    connectBinanceWS();
+  }
+  // ===================================================
 
   // ===== Actions =====
   $('#btn-add-band').addEventListener('click', ()=>{
@@ -667,7 +740,8 @@
       try{ const j=JSON.parse(raw); renderBands(j.bands ?? DEFAULT_BANDS); }
       catch{ renderBands(DEFAULT_BANDS); }
     }else{ renderBands(DEFAULT_BANDS); }
-    startPolling();
+    startPolling();   // 기존 폴링(환율/상태/로그/백업)
+    startRealtime();  // 실시간 김프(업비트/바이낸스 WS)
   })();
 </script>
 </body>

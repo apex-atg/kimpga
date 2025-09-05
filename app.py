@@ -37,17 +37,49 @@ TIMEOUT = (3, 7)
 UPBIT_TAKER_FEE   = float(os.getenv("UPBIT_TAKER_FEE",  "0.0005"))  # 0.05%
 BINANCE_TAKER_FEE = float(os.getenv("BINANCE_TAKER_FEE","0.0004"))  # 0.04%
 
-# 목표 순이익(+0.10%p)과 슬리피지 버퍼(기본 0.05%p)를 합쳐 최소 폭을 강제
+# 목표 순이익(+0.10%p) 기본과 슬리피지 버퍼(기본 0.05%p)
 TARGET_NET_PROFIT_BP = float(os.getenv("TARGET_NET_PROFIT_BP","0.10"))  # %p
-SLIPPAGE_BP_BUFFER   = float(os.getenv("SLIPPAGE_BP_BUFFER","0.05"))    # %p
+SLIPPAGE_BP_BUFFER   = float(os.getenv("SLIPPAGE_BP_BUFFER","0.05"))    # %p (하한)
 FEES_BP = (UPBIT_TAKER_FEE*2 + BINANCE_TAKER_FEE*2) * 100.0             # ≈0.18%p
-REQUIRED_SPREAD_BP = round(FEES_BP + TARGET_NET_PROFIT_BP + SLIPPAGE_BP_BUFFER, 4)
+
+# ✅ 청산 최소 순이익 가드 + 보유 상한
+MIN_NET_EXIT_BP = float(os.getenv("MIN_NET_EXIT_BP","0.08"))  # %p, 추정 순이익이 이 값 미만이면 청산 보류
+MAX_HOLD_SEC    = int(float(os.getenv("MAX_HOLD_SEC","120"))) # 초, 초과시 가드 무시하고 청산 시도
+
+# ✅ 슬리피지 적응형(EMA)
+_slip_ema = SLIPPAGE_BP_BUFFER
+_SLIP_ALPHA = 0.2
+def _update_slip_ema_from_observed(slip_bp: float):
+    """관측된 bp 손실(목표대비 못먹은 bp 또는 목표-실현의 절댓값)을 EMA로 반영"""
+    global _slip_ema
+    slip_bp = max(0.0, float(slip_bp))
+    _slip_ema = (1.0 - _SLIP_ALPHA) * _slip_ema + _SLIP_ALPHA * slip_bp
+
+def _current_slip_buffer()->float:
+    """고정 최소버퍼와 EMA 중 더 큰 값을 사용"""
+    return max(SLIPPAGE_BP_BUFFER, _slip_ema)
+
+def required_spread_bp()->float:
+    """현재 요구 최소 Δ김프(%p): 수수료 + 목표 순이익 + (적응형) 슬리피지 버퍼"""
+    return round(FEES_BP + TARGET_NET_PROFIT_BP + _current_slip_buffer(), 4)
 
 def floor_step(x: float, step: float = 0.001) -> float:
     return math.floor(float(x)/step)*step
 
+# ---------------- Entry tuning (NEW) ----------------
+# 바이낸스 선물 최소/스텝 (요구사항: 0.006 BTC)
+BN_LOT_STEP = float(os.getenv("BN_LOT_STEP", "0.006"))
+# 업비트 금액시장가 매수 시 살짝 덜 사서 오버헷지 방지
+UNDERBUY_RATIO = float(os.getenv("UNDERBUY_RATIO", "0.998"))
+# 목표 김프 도달 시 즉시 동시 청산 (순이익 가드 무시)
+FAST_EXIT_NO_GUARD = str(os.getenv("FAST_EXIT_NO_GUARD","true")).lower() in ("1","true","yes")
+# 업비트 수량 표시 정밀도(잔량 트림용)
+UPBIT_VOL_PRECISION = int(os.getenv("UPBIT_VOL_PRECISION", "8"))
+def fmt_upbit_qty(q: float) -> str:
+    return f"{float(q):.{UPBIT_VOL_PRECISION}f}"
+
 # ---------------- Auto sizing ----------------
-AUTO_SIZE_DEFAULT = True                       # 기본: 자동 사이징 켜기
+AUTO_SIZE_DEFAULT = True
 KRW_BUF_RATIO     = float(os.getenv("KRW_BUF_RATIO","0.001"))   # 0.1% 버퍼
 USDT_FEE_BUFFER   = float(os.getenv("USDT_FEE_BUFFER","1.0"))   # 수수료/슬리피지 대비 USDT 버퍼
 
@@ -63,6 +95,11 @@ fees_upbit_krw_cum = 0.0
 fees_binance_usdt_cum = 0.0
 fees_binance_krw_cum = 0.0
 
+# ▶ NEW: 최근 청산 / 미실현 분리
+last_realized_pnl_krw = 0.0
+recent_closes: List[Dict[str, Any]] = []
+MAX_RECENT_CLOSES = 20
+
 # 밴드 큐
 # state: waiting → hedging → entered → closed / cancelled
 bands: Dict[str, Dict[str, Any]] = {}
@@ -70,7 +107,6 @@ bands: Dict[str, Dict[str, Any]] = {}
 # 기본 옵션
 DEFAULT_TOLERANCE = float(os.getenv("DEFAULT_TOLERANCE","0.10"))
 DEFAULT_LEVERAGE  = int(float(os.getenv("DEFAULT_LEVERAGE","3")))
-# === 조기 트리거 제거(기본값 OFF) ===
 DEFAULT_EXIT_ON_SIGN_CHANGE = False
 DEFAULT_EXIT_ON_MOVE_BP = 0.0
 
@@ -173,7 +209,7 @@ def get_upbit_balance_real()->Tuple[float,float]:
         r.raise_for_status(); krw=btc=0.0
         for b in r.json():
             if b["currency"]=="KRW": krw=float(b["balance"])
-            elif b["currency"]=="BTC": btc=float(b["balance"]) + float(b["locked"])  # 체결대기 포함
+            elif b["currency"]=="BTC": btc=float(b["balance"]) + float(b["locked"])
         return krw, btc
     except Exception as e:
         metrics["api_errors"]+=1; log(f"[UPBIT 잔고 오류]{e}"); return 0.0,0.0
@@ -273,11 +309,14 @@ def _new_band_id()->str:
 
 def _reset_band_trade_fields(band: Dict[str, Any]) -> None:
     band["entry_kimp_value"] = None
+    band["entry_ts"] = None
     band["upbit"] = {"buy_uuid": None, "sell_uuid": None,
                      "buy_krw": 0.0, "sell_krw": 0.0, "fee_krw": 0.0, "filled_qty": 0.0}
     band["binance"] = {"sell_id": None, "buy_id": None,
                        "entry_qty": 0.0, "entry_avg": 0.0, "exit_qty": 0.0, "exit_avg": 0.0,
                        "fee_usdt": 0.0, "entry_margin_usdt": 0.0}
+    # 트레일링/손절용 상태
+    band["peak_kimp_after_entry"] = None
 
 def _rearm_after_cooldown(band_id: str, cooldown: int) -> None:
     try:
@@ -298,7 +337,7 @@ def compute_band_pnl_krw(band: Dict[str, Any], fx_for_exit: float) -> float:
 
     up = band["upbit"]; bn = band["binance"]
 
-    # --- Upbit: 총액으로 갱신, 누적은 델타만 ---
+    # --- Upbit ---
     buy_funds = buy_vol = buy_fee = 0.0
     if up["buy_uuid"]:
         buy_funds, buy_vol, buy_fee = summarize_upbit_order(up["buy_uuid"])
@@ -315,7 +354,7 @@ def compute_band_pnl_krw(band: Dict[str, Any], fx_for_exit: float) -> float:
 
     upbit_pnl = up["sell_krw"] - up["buy_krw"] - up["fee_krw"]
 
-    # --- Binance: 총액으로 갱신, 누적은 델타만 ---
+    # --- Binance ---
     entry_qty = entry_avg = entry_fee = 0.0
     if bn.get("sell_id"):
         entry_qty, entry_avg, entry_fee = summarize_binance_order(bn["sell_id"])
@@ -338,103 +377,189 @@ def compute_band_pnl_krw(band: Dict[str, Any], fx_for_exit: float) -> float:
     total_krw = upbit_pnl + fut_pnl_usdt * fx_for_exit
     band["pnl_krw"] = total_krw
     band["last_pnl_krw"] = total_krw
+
+    # ▶ NEW: 마지막 청산 디테일 저장
+    band["last_close_detail"] = {
+        "qty_close": qty_close,
+        "upbit_pnl": upbit_pnl,
+        "fut_pnl_usdt": fut_pnl_usdt,
+        "fx": fx_for_exit,
+    }
+
     log(f"[실현손익/{band['id']}] {total_krw:+,.0f} KRW (Upbit {upbit_pnl:+,.0f} + Bin {fut_pnl_usdt:+.3f}USDT)")
     return total_krw
 
+# ▶ NEW: 미실현 PnL(열린 포지션) 추정
+def estimate_unrealized_pnl_krw(band: Dict[str, Any], up_now: float, bp_now: float, fx_now: float) -> float:
+    up = band["upbit"]; bn = band["binance"]
+    qty = float(up.get("filled_qty", 0.0))
+    if qty <= 0: return 0.0
+    # 업비트: 평가 손익 (매수원가+수수료 대비)
+    buy_krw = float(up.get("buy_krw", 0.0))
+    buy_fee_krw = float(up.get("fee_krw", 0.0))
+    upbit_unreal = (up_now * qty) - (buy_krw + buy_fee_krw)
+    # 선물: 진입평균 대비 현재가 (진입수수료 차감)
+    entry_avg = float(bn.get("entry_avg", 0.0))
+    entry_qty = float(bn.get("entry_qty", 0.0))
+    entry_fee_usdt = float(bn.get("fee_usdt", 0.0))
+    fut_unreal_usdt = (entry_avg - bp_now) * min(qty, entry_qty) - entry_fee_usdt
+    return upbit_unreal + fut_unreal_usdt * fx_now
+
 # ---------------- Entry/Exit ----------------
 def _compute_auto_size_amount(up: float, bp: float, leverage: int, band: Dict[str, Any]) -> float:
-    # 잔고 기반 최대 q 계산
     krw_bal, _ = get_upbit_balance_real()
     usdt_bal   = get_binance_balance_real()
-
-    # 업비트: gross_krw = q*up / (1 - fee) ≤ krw_bal*(1 - KRW_BUF_RATIO)
     krw_limit = max(0.0, krw_bal * (1.0 - KRW_BUF_RATIO))
     q_upbit_max = (krw_limit * (1.0 - UPBIT_TAKER_FEE)) / max(1e-9, up)
-
-    # 바이낸스: margin = q*bp / L ≤ usdt_bal - USDT_FEE_BUFFER
     usdt_limit = max(0.0, usdt_bal - USDT_FEE_BUFFER)
     q_binance_max = (usdt_limit * leverage) / max(1e-9, bp)
-
     q_user_cap = float(band.get("max_amount_btc", float("inf")))
     q_cfg_cap  = float(band.get("amount_btc", q_user_cap))
     desired = min(q_upbit_max, q_binance_max, q_user_cap, q_cfg_cap)
     return floor_step(max(0.0, desired), 0.001)
 
+# === 즉시 청산 (동시 주문) ===
+def _exit_now(band: Dict[str, Any]) -> None:
+    qty_u = round(float(band["upbit"].get("filled_qty",0.0)), 3)
+    if qty_u <= 0:
+        log(f"[청산 건너뜀/{band['id']}] 보유수량 0"); band["state"] = "closed"; return
+
+    # 업비트/바이낸스를 '동시에' 발사 (thread)
+    def _sell_upbit(q):
+        sold_total, u_uuid = _sell_upbit_exact(q)
+        if u_uuid: _ = _wait_upbit_filled(u_uuid, sold_total)
+        return sold_total
+
+    def _buy_binance(q):
+        ok_b, b_id = binance_order("buy", 0.0, q, reduce_only=True)
+        if ok_b and b_id: _ = _wait_binance_filled(b_id, q)
+        return ok_b
+
+    th1 = threading.Thread(target=_sell_upbit, args=(qty_u,), daemon=True)
+    th2 = threading.Thread(target=_buy_binance, args=(qty_u,), daemon=True)
+    th1.start(); th2.start(); th1.join(); th2.join()
+
+    pnl = compute_band_pnl_krw(band, get_usdkrw())
+    globals()["profit_krw"] += pnl
+
+    # ▶ NEW: 최근 청산 값/목록 업데이트
+    globals()["last_realized_pnl_krw"] = pnl
+    detail = band.get("last_close_detail", {}) or {}
+    recent_closes.append({
+        "id": band["id"],
+        "ts": time.time(),
+        "qty": float(band["upbit"].get("filled_qty", 0.0)),
+        "entry_kimp": band.get("entry_kimp_value"),
+        "exit_kimp": band.get("exit_kimp"),
+        "pnl_krw": pnl,
+        "upbit_pnl": detail.get("upbit_pnl"),
+        "fut_pnl_usdt": detail.get("fut_pnl_usdt"),
+        "fx": detail.get("fx"),
+    })
+    if len(recent_closes) > MAX_RECENT_CLOSES:
+        del recent_closes[: len(recent_closes) - MAX_RECENT_CLOSES]
+
+    band["state"] = "closed"
+    band["last_close_ts"] = time.time()
+    log(f"[청산 완료/{band['id']}] 동시청산, 실현손익={pnl:+,.0f} KRW")
+
+    if band.get("repeat", False):
+        cooldown = int(band.get("cooldown_sec", 0))
+        log(f"[자동 재무장 예약] id={band['id']} cooldown={cooldown}s")
+        threading.Thread(target=_rearm_after_cooldown, args=(band["id"], cooldown), daemon=True).start()
+
+# === 진입 (바이낸스 숏 → 환율×체결가로 업비트 금액매수) ===
 def try_enter_band(band: Dict[str, Any], kimp: float, up: float, bp: float) -> None:
     if band["state"] != "waiting": return
     if abs(kimp - band["entry_kimp"]) > band["tolerance"]: return
 
     leverage = int(band.get("leverage", DEFAULT_LEVERAGE))
+    # 1) 최대 수량 산정 후 0.006 스텝으로 내림
     if bool(band.get("auto_size", AUTO_SIZE_DEFAULT)):
         desired_btc = _compute_auto_size_amount(up, bp, leverage, band)
     else:
-        desired_btc = floor_step(float(band.get("amount_btc", 0.0)), 0.001)
-    if desired_btc <= 0: return
+        desired_btc = float(band.get("amount_btc", 0.0))
+    base_qty = floor_step(max(0.0, desired_btc), BN_LOT_STEP)
+    base_qty = floor_step(base_qty, 0.001)  # .3f 포맷 안전
 
-    # 업비트 예산 체크 + 소액 버퍼
-    gross_krw = desired_btc * up / max(1e-9, (1.0 - UPBIT_TAKER_FEE))
-    gross_krw *= (1.0 + KRW_BUF_RATIO)
-    gross_krw_int = int(math.ceil(gross_krw))
-    krw_bal, _ = get_upbit_balance_real()
-    if krw_bal + 1e-6 < gross_krw_int:
-        log(f"[진입 중단/{band['id']}] KRW 부족 have≈{krw_bal:.0f}, need≈{gross_krw_int}")
+    if base_qty <= 0:
         return
 
-    # 바이낸스 예산 체크(버퍼 포함)
-    need_usdt_est = (desired_btc * bp) / max(1, leverage)
+    # 2) 증거금/예산 체크
     have_usdt = get_binance_balance_real()
+    need_usdt_est = (base_qty * bp) / max(1, leverage)
     if have_usdt + 1e-6 < need_usdt_est + USDT_FEE_BUFFER:
         log(f"[진입 중단/{band['id']}] USDT 부족 have≈{have_usdt:.2f}, need≈{need_usdt_est+USDT_FEE_BUFFER:.2f}")
         return
 
-    # 테스트 주문
+    # 3) 바이낸스 숏 먼저 (시장가)
     try:
         _ = _bn_signed_post("/fapi/v1/order/test",
-                            {"symbol":"BTCUSDT","side":"SELL","type":"MARKET",
-                             "quantity":format(desired_btc, ".3f")})
+                            {"symbol":"BTCUSDT","side":"SELL","type":"MARKET","quantity":format(base_qty, ".3f")})
     except Exception as _e:
         log(f"[진입 중단/{band['id']}] Binance test 실패: {_e}")
         return
 
-    # --- 실제 체결 ---
-    ok_u, u_uuid = upbit_order("buy", gross_krw_int, desired_btc)
-    if not ok_u or not u_uuid:
-        log(f"[진입 실패/{band['id']}] 업비트 매수 실패"); return
-    band["upbit"]["buy_uuid"] = u_uuid
-
-    # 업비트 체결 수량을 그대로 바이낸스 숏 수량으로 사용 (사이즈 매칭)
-    filled_qty = 0.0
-    for _ in range(8):
-        time.sleep(0.25)
-        _, vol, _ = summarize_upbit_order(u_uuid)
-        if vol > 0: filled_qty = vol; break
-    if filled_qty <= 0: filled_qty = desired_btc
-
-    binance_qty = floor_step(filled_qty, 0.001)
-    if binance_qty <= 0:
-        band["state"] = "hedging"; band["upbit"]["filled_qty"] = 0.0
-        log(f"[진입 보류/{band['id']}] 체결 수량 0 → hedging"); return
-
-    ok_b, b_id = binance_order("sell", 0.0, binance_qty)
+    ok_b, b_id = binance_order("sell", 0.0, base_qty)
     if not ok_b or not b_id:
-        log(f"[헤지 대기/{band['id']}] 바이낸스 숏 실패 → hedging")
-        band["state"] = "hedging"; band["upbit"]["filled_qty"] = round(filled_qty, 3); return
-
-    band["state"] = "entered"
-    band["entry_kimp_value"] = float(kimp)
-    band["upbit"]["filled_qty"] = round(filled_qty, 3)
+        log(f"[진입 실패/{band['id']}] 바이낸스 숏 실패"); return
     band["binance"]["sell_id"] = b_id
 
-    # ▼ 진입 체결 요약 → 진입 증거금(USDT) 저장
-    q,a,f = summarize_binance_order(b_id)
-    lev = int(band.get("leverage", DEFAULT_LEVERAGE))
-    band["binance"]["entry_qty"], band["binance"]["entry_avg"] = q, a
-    band["binance"]["entry_margin_usdt"] = (q * a) / max(1, lev)
+    # 체결된 실제 수량/평균가 확인
+    _ = _wait_binance_filled(b_id, base_qty, timeout=3.0)
+    bn_qty, bn_avg, _fee = summarize_binance_order(b_id)
+    bn_qty = floor_step(bn_qty, BN_LOT_STEP)
+    bn_qty = floor_step(bn_qty, 0.001)
+    if bn_qty <= 0:
+        log(f"[진입 취소/{band['id']}] 바이낸스 체결수량 0"); return
 
-    log(f"[진입 성공/{band['id']}] ~{filled_qty:.3f} BTC (auto_size={band.get('auto_size', AUTO_SIZE_DEFAULT)}) / 김프 {kimp}% @entry {band['entry_kimp']}±{band['tolerance']}")
+    # 4) 환율→ 업비트 금액 계산 (오버헷지 방지 위해 UNDERBUY_RATIO 적용)
+    fx = get_usdkrw()
+    krw_amount = bn_avg * bn_qty * fx * UNDERBUY_RATIO
+    krw_amount_int = int(math.floor(krw_amount))
+
+    krw_bal, _ = get_upbit_balance_real()
+    if krw_bal + 1e-6 < krw_amount_int:
+        log(f"[진입 중단/{band['id']}] KRW 부족 have≈{krw_bal:.0f}, need≈{krw_amount_int}")
+        return
+
+    # 5) 업비트 금액시장가 매수 (바낸 수량 이하로 유도)
+    ok_u, u_uuid = upbit_order("buy", krw_amount_int, 0.0)
+    if not ok_u or not u_uuid:
+        log(f"[경고/{band['id']}] 업비트 금액매수 실패 → hedging 상태로 전환")
+        band["state"] = "hedging"; band["upbit"]["filled_qty"] = 0.0
+        return
+    band["upbit"]["buy_uuid"] = u_uuid
+
+    # 실제 체결 수량 확인
+    up_funds, up_vol, _ = _wait_upbit_filled(u_uuid, 0.0, timeout=5.0)
+    up_vol = round(up_vol, 8)
+
+    # 혹시라도 업비트가 더 많이 샀다면 즉시 트림(드묾)
+    if up_vol - bn_qty > 1e-8:
+        excess = float(f"{(up_vol - bn_qty):.8f}")
+        if excess > 0:
+            ok_trim, trim_uuid = upbit_order("sell", 0.0, excess)
+            if ok_trim and trim_uuid:
+                _ = _wait_upbit_filled(trim_uuid, excess)
+            up_vol = bn_qty
+            log(f"[잔여 트림/{band['id']}] upbit_excess={excess:.8f} → 맞춤 {up_vol:.8f}")
+
+    # 6) 상태 저장
+    band["state"] = "entered"
+    band["entry_kimp_value"] = float(kimp)
+    band["entry_ts"] = time.time()
+    band["upbit"]["filled_qty"] = float(f"{min(up_vol, bn_qty):.3f}")  # .3f 저장
+    band["peak_kimp_after_entry"] = None
+
+    lev = int(band.get("leverage", DEFAULT_LEVERAGE))
+    band["binance"]["entry_qty"], band["binance"]["entry_avg"] = bn_qty, bn_avg
+    band["binance"]["entry_margin_usdt"] = (bn_qty * bn_avg) / max(1, lev)
+
+    _update_slip_ema_from_observed(abs(float(kimp) - float(band["entry_kimp"])))
+    log(f"[진입 성공(BN→UP)/{band['id']}] bn_qty={bn_qty:.3f} up_qty={up_vol:.8f} fx={fx:.2f} krw≈{krw_amount_int:,} 김프={kimp}%")
 
 def _sell_upbit_exact(qty: float) -> Tuple[float, Optional[str]]:
-    """업비트 시장가로 qty 전량을 최대 3회에 나눠 강제 매도. (잔량 0 보장 시도)"""
     qty = round(max(0.0, float(qty)), 3)
     left = qty; sold_total = 0.0; last_uuid = None
     for _ in range(3):
@@ -450,7 +575,6 @@ def _sell_upbit_exact(qty: float) -> Tuple[float, Optional[str]]:
         left = round(qty - sold_total, 3)
     return round(sold_total,3), last_uuid
 
-# ▼ 체결 완료 대기 유틸
 def _wait_upbit_filled(uuid_str: str, expect_qty: float, timeout: float = 5.0) -> Tuple[float,float,float]:
     t0=time.time(); funds=vol=fee=0.0
     while time.time()-t0 < timeout:
@@ -473,43 +597,72 @@ def try_exit_band(band: Dict[str, Any], kimp: float) -> None:
     if band["state"] != "entered": return
 
     entry = band.get("entry_kimp_value")
-    exit_k = band["exit_kimp"]
+    exit_k = float(band["exit_kimp"])
+    tp_k   = band.get("tp_kimp")
+    sl_k   = band.get("sl_kimp")
+    trail  = float(band.get("trail_bp", 0.0))
+    be_mov = float(band.get("breakeven_shift_bp", 0.0))
 
-    # === 오직 exit_kimp 도달만 사용 ===
-    crossed = (kimp >= exit_k) if (entry is None or exit_k >= float(entry)) else (kimp <= exit_k)
-    if not crossed: return
+    # === 현재 수익/손실 bp 추정 ===
+    est_net_bp = None
+    if entry is not None:
+        est_net_bp = (float(kimp) - float(entry)) - FEES_BP - _current_slip_buffer()
 
-    log(f"[청산 트리거/{band['id']}:exit_kimp] entry={entry}, now={kimp}")
+    # 브레이크이븐 이동
+    if entry is not None and be_mov > 0 and est_net_bp is not None and est_net_bp >= be_mov:
+        be_line = float(entry) + FEES_BP + _current_slip_buffer()
+        if sl_k is None or (exit_k >= float(entry) and be_line > float(sl_k)) or (exit_k < float(entry) and be_line < float(sl_k)):
+            band["sl_kimp"] = be_line
+            sl_k = be_line
 
-    qty_u = round(float(band["upbit"].get("filled_qty",0.0)), 3)
-    if qty_u <= 0:
-        log(f"[청산 건너뜀/{band['id']}] 보유수량 0"); band["state"] = "closed"; return
+    # 트레일링 피크 갱신
+    if entry is not None:
+        favorable = (float(kimp) >= float(entry)) if exit_k >= float(entry) else (float(kimp) <= float(entry))
+        if favorable:
+            pk = band.get("peak_kimp_after_entry")
+            if pk is None:
+                band["peak_kimp_after_entry"] = float(kimp)
+            else:
+                if exit_k >= float(entry):
+                    if float(kimp) > pk: band["peak_kimp_after_entry"] = float(kimp)
+                else:
+                    if float(kimp) < pk: band["peak_kimp_after_entry"] = float(kimp)
 
-    # 업비트: 잔량 0이 될 때까지 재매도
-    sold_total, u_uuid = _sell_upbit_exact(qty_u)
-    if u_uuid:
-        band["upbit"]["sell_uuid"] = u_uuid
-        _ = _wait_upbit_filled(u_uuid, sold_total)  # ✅ 체결 완료 대기
+    # 손절
+    if sl_k is not None:
+        if (exit_k >= float(entry or exit_k) and kimp <= float(sl_k)) or (exit_k < float(entry or exit_k) and kimp >= float(sl_k)):
+            log(f"[손절/{band['id']}] kimp={kimp} sl_kimp={sl_k} est_net={est_net_bp}")
+            return _exit_now(band)
 
-    # 바이낸스: 업비트 매도된 '실제 수량'만큼 reduceOnly 매수
-    if sold_total > 0:
-        ok_b, b_id = binance_order("buy", 0.0, sold_total, reduce_only=True)
-        if ok_b and b_id:
-            band["binance"]["buy_id"] = b_id
-            _ = _wait_binance_filled(b_id, sold_total)  # ✅ 체결 완료 대기
+    # 트레일링 익절
+    if trail > 0 and band.get("peak_kimp_after_entry") is not None:
+        pk = float(band["peak_kimp_after_entry"]); hit=False
+        if exit_k >= float(entry or exit_k):
+            if pk - float(kimp) >= trail: hit=True
+        else:
+            if float(kimp) - pk >= trail: hit=True
+        if hit:
+            log(f"[트레일링 익절/{band['id']}] pk={pk} kimp={kimp} trail={trail}")
+            return _exit_now(band)
 
-    pnl = compute_band_pnl_krw(band, get_usdkrw())
-    globals()["profit_krw"] += pnl
+    # 기본 익절(목표 김프 도달)
+    def crossed(target, ref):
+        return (kimp >= target) if (ref is None or target >= float(ref)) else (kimp <= target)
 
-    band["state"] = "closed"
-    band["last_close_ts"] = time.time()
-    log(f"[청산 완료/{band['id']}] 상태=closed, 실현손익={pnl:+,.0f} KRW")
-
-    # 자동 재무장
-    if band.get("repeat", False):
-        cooldown = int(band.get("cooldown_sec", 0))
-        log(f"[자동 재무장 예약] id={band['id']} cooldown={cooldown}s")
-        threading.Thread(target=_rearm_after_cooldown, args=(band["id"], cooldown), daemon=True).start()
+    target_exit = float(tp_k) if tp_k is not None else exit_k
+    if crossed(target_exit, entry):
+        if FAST_EXIT_NO_GUARD:
+            log(f"[익절(빠름)/{band['id']}] kimp={kimp} target={target_exit}")
+            return _exit_now(band)
+        # 가드 적용
+        if entry is not None:
+            min_req = float(band.get("min_net_exit_bp", MIN_NET_EXIT_BP))
+            held = time.time() - float(band.get("entry_ts") or time.time())
+            if held <= MAX_HOLD_SEC and est_net_bp is not None and est_net_bp + 1e-9 < min_req:
+                log(f"[청산 보류/{band['id']}] est_net={est_net_bp:.3f}%p < min_req={min_req:.3f}%p hold={held:.1f}s")
+                return
+        log(f"[익절/{band['id']}] kimp={kimp} target={target_exit}")
+        return _exit_now(band)
 
 # ---------------- Strategy loop ----------------
 def strategy_loop(global_cfg: Dict[str, Any]) -> None:
@@ -526,6 +679,7 @@ def strategy_loop(global_cfg: Dict[str, Any]) -> None:
             for b in list(bands.values()):
                 if b["state"] == "waiting":  try_enter_band(b, kimp, up, bp)
 
+            # (레거시 헤징 경로 유지 — 현재 경로에서는 거의 사용되지 않음)
             for b in list(bands.values()):
                 if b.get("state") == "hedging" and b["upbit"].get("filled_qty",0.0) > 0.0:
                     q = floor_step(b["upbit"].get("filled_qty",0.0), 0.001)
@@ -533,6 +687,7 @@ def strategy_loop(global_cfg: Dict[str, Any]) -> None:
                     if ok_b and b_id:
                         b["binance"]["sell_id"] = b_id
                         b["entry_kimp_value"] = float(kimp)
+                        b["entry_ts"] = time.time()
                         b["state"] = "entered"
                         log(f"[헤지 성공/{b['id']}] q={q:.3f} BTC → entered")
 
@@ -553,7 +708,7 @@ def current_kimp():
     k, up, bp, fx = calc_kimp()
     fee_bp_est = round(FEES_BP, 2)
     return jsonify({"kimp":k,"upbit_price":up,"binance_price":bp,"usdkrw":fx,
-                    "fee_bp_est":fee_bp_est,"required_spread_bp":REQUIRED_SPREAD_BP})
+                    "fee_bp_est":fee_bp_est,"required_spread_bp":required_spread_bp()})
 
 @app.route("/balance")
 def balance():
@@ -563,8 +718,17 @@ def balance():
 @app.route("/status")
 def status():
     fx_now = get_usdkrw(); fees_binance_krw_now = fees_binance_usdt_cum * fx_now
+    # 실시간 가격 (미실현 계산용)
+    k_now, up_now, bp_now, _ = calc_kimp()
+
     out_bands = []
+    unrealized_total = 0.0
     for b in bands.values():
+        unreal_now = 0.0
+        if b.get("state") == "entered":
+            unreal_now = estimate_unrealized_pnl_krw(b, up_now, bp_now, fx_now)
+            unrealized_total += unreal_now
+
         out_bands.append({
             "id": b["id"], "state": b["state"],
             "entry_kimp": b["entry_kimp"], "exit_kimp": b["exit_kimp"],
@@ -572,35 +736,46 @@ def status():
             "leverage": b["leverage"], "entry_kimp_value": b.get("entry_kimp_value"),
             "filled_qty": b["upbit"].get("filled_qty",0.0),
             "pnl_krw": round(b.get("pnl_krw",0.0),0),
+            "last_pnl_krw": round(b.get("last_pnl_krw",0.0),0),
+            "unrealized_krw_now": round(unreal_now, 0),
             "repeat": bool(b.get("repeat", False)),
             "cooldown_sec": int(b.get("cooldown_sec", 0)),
             "times_armed": int(b.get("times_armed", 0)),
-            "last_pnl_krw": round(b.get("last_pnl_krw",0.0),0),
             "auto_size": bool(b.get("auto_size", AUTO_SIZE_DEFAULT)),
             "max_amount_btc": float(b.get("max_amount_btc", float("inf"))),
             "binance_entry_margin_usdt": round(b.get("binance",{}).get("entry_margin_usdt",0.0), 3),
+            "min_net_exit_bp": float(b.get("min_net_exit_bp", MIN_NET_EXIT_BP)),
+            # 전략 옵션 노출
+            "tp_kimp": b.get("tp_kimp"),
+            "sl_kimp": b.get("sl_kimp"),
+            "trail_bp": float(b.get("trail_bp", 0.0)),
+            "breakeven_shift_bp": float(b.get("breakeven_shift_bp", 0.0)),
         })
     return jsonify({
         "running": running, "logs": logs[-350:], "last_error": last_error,
         "binance_testnet": BINANCE_TESTNET, "binance_base": BASE_FAPI,
         "pnl": {
-            "profit_krw_cum": round(profit_krw, 0),
+            "profit_krw_cum": round(profit_krw, 0),                 # 누적 실현
+            "last_realized_krw": round(last_realized_pnl_krw, 0),   # ▶ 최근 청산 1건
+            "unrealized_krw_now": round(unrealized_total, 0),       # ▶ 열린 포지션 총 미실현
             "fees_upbit_krw_cum": round(fees_upbit_krw_cum, 0),
             "fees_binance_usdt_cum": round(fees_binance_usdt_cum, 3),
             "fees_binance_krw_cum": round(fees_binance_krw_cum, 0),
             "fees_binance_krw_now": round(fees_binance_krw_now, 0),
         },
-        "required_spread_bp": REQUIRED_SPREAD_BP,
+        "recent_closes": recent_closes[-MAX_RECENT_CLOSES:],        # ▶ 최근 N건 리스트
+        "required_spread_bp": required_spread_bp(),
         "bands": out_bands,
     })
 
 # ---- Bands management ----
 def _guard_required_spread(entry_kimp: float, exit_kimp: float)->Tuple[bool,str]:
     spread = abs(exit_kimp - entry_kimp)
-    if spread + 1e-12 < REQUIRED_SPREAD_BP:
-        return False, (f"Δ김프 {spread:.2f}%p < 최소 요구 {REQUIRED_SPREAD_BP:.2f}%p"
+    req = required_spread_bp()
+    if spread + 1e-12 < req:
+        return False, (f"Δ김프 {spread:.2f}%p < 최소 요구 {req:.2f}%p"
                        f" (수수료≈{FEES_BP:.2f}%p + 순이익 {TARGET_NET_PROFIT_BP:.2f}%p"
-                       f" + 슬리피지 {SLIPPAGE_BP_BUFFER:.2f}%p)")
+                       f" + 슬리피지≥{_current_slip_buffer():.2f}%p)")
     return True, ""
 
 @app.route("/bands", methods=["GET"])
@@ -616,15 +791,21 @@ def bands_add():
         ok,msg = _guard_required_spread(entry_kimp, exit_kimp)
         if not ok: return jsonify({"status":"error","error":msg}), 400
 
-        amount_btc = max(0.001, float(body.get("amount_btc", 0.01)))  # 상한(또는 기본)
+        amount_btc = max(0.001, float(body.get("amount_btc", 0.01)))
         tolerance  = float(body.get("tolerance", DEFAULT_TOLERANCE))
         leverage   = int(float(body.get("leverage", DEFAULT_LEVERAGE)))
         repeat     = bool(body.get("repeat", REPEAT_DEFAULT))
         cooldown   = int(float(body.get("cooldown_sec", REPEAT_COOLDOWN_DEFAULT)))
 
-        # auto sizing
         auto_size       = bool(body.get("auto_size", AUTO_SIZE_DEFAULT))
-        max_amount_btc  = float(body.get("max_amount_btc", amount_btc))  # 사용자 상한
+        max_amount_btc  = float(body.get("max_amount_btc", amount_btc))
+        min_net_exit_bp = float(body.get("min_net_exit_bp", MIN_NET_EXIT_BP))
+
+        # 선택 옵션
+        tp_kimp = body.get("tp_kimp")
+        sl_kimp = body.get("sl_kimp")
+        trail_bp = float(body.get("trail_bp", 0.0))
+        breakeven_shift_bp = float(body.get("breakeven_shift_bp", 0.0))
     except Exception as e:
         return jsonify({"status":"error","error":f"bad_params: {e}"}), 400
 
@@ -633,11 +814,18 @@ def bands_add():
         "id": bid, "state": "waiting",
         "entry_kimp": entry_kimp, "exit_kimp": exit_kimp,
         "tolerance": tolerance, "amount_btc": amount_btc, "leverage": leverage,
-        "exit_on_sign_change": DEFAULT_EXIT_ON_SIGN_CHANGE,  # 비활성
-        "exit_on_move_bp": DEFAULT_EXIT_ON_MOVE_BP,          # 비활성
+        "exit_on_sign_change": DEFAULT_EXIT_ON_SIGN_CHANGE,
+        "exit_on_move_bp": DEFAULT_EXIT_ON_MOVE_BP,
         "repeat": repeat, "cooldown_sec": cooldown, "times_armed": 0,
         "auto_size": auto_size, "max_amount_btc": max_amount_btc,
-        "entry_kimp_value": None,
+        "entry_kimp_value": None, "entry_ts": None,
+        "min_net_exit_bp": min_net_exit_bp,
+        # 선택 옵션
+        "tp_kimp": float(tp_kimp) if tp_kimp is not None else None,
+        "sl_kimp": float(sl_kimp) if sl_kimp is not None else None,
+        "trail_bp": trail_bp,
+        "breakeven_shift_bp": breakeven_shift_bp,
+        "peak_kimp_after_entry": None,
         "upbit": {"buy_uuid": None, "sell_uuid": None, "buy_krw": 0.0, "sell_krw": 0.0, "fee_krw": 0.0, "filled_qty": 0.0},
         "binance": {"sell_id": None, "buy_id": None, "entry_qty": 0.0, "entry_avg": 0.0, "exit_qty": 0.0, "exit_avg": 0.0,
                     "fee_usdt": 0.0, "entry_margin_usdt": 0.0},
@@ -646,8 +834,9 @@ def bands_add():
     bands[bid] = band
     log(f"[밴드 추가] id={bid} entry={entry_kimp} exit={exit_kimp} tol=±{tolerance} "
         f"amount={amount_btc}BTC lev=x{leverage} repeat={repeat} cd={cooldown} "
-        f"auto_size={auto_size} max_amount_btc={max_amount_btc} "
-        f"(최소요구 {REQUIRED_SPREAD_BP:.2f}%p)")
+        f"auto_size={auto_size} max_amount_btc={max_amount_btc} min_net_exit_bp={min_net_exit_bp} "
+        f"tp={band['tp_kimp']} sl={band['sl_kimp']} trail={trail_bp} be_move={breakeven_shift_bp} "
+        f"(최소요구 {required_spread_bp():.2f}%p)")
     return jsonify({"status":"ok","id":bid})
 
 @app.route("/bands/update_repeat", methods=["POST"])
@@ -694,7 +883,7 @@ def start():
     if not running:
         keys = load_api_keys()
         if not keys.get("binance_key") or not keys.get("binance_secret"):
-            last_error="binance_api_key_missing"; log("[전략 시작 실패] BINANCE 키 누락")
+            last_error="binance_invalid_key_missing"; log("[전략 시작 실패] BINANCE 키 누락")
             return jsonify({"status":"error","error":last_error}), 400
         cfg_in = request.json or {}
         if "target_kimp" in cfg_in or "entry_kimp" in cfg_in:
@@ -710,6 +899,14 @@ def start():
             cooldown= int(float(cfg_in.get("cooldown_sec", REPEAT_COOLDOWN_DEFAULT)))
             auto_size = bool(cfg_in.get("auto_size", AUTO_SIZE_DEFAULT))
             max_amount_btc = float(cfg_in.get("max_amount_btc", amount))
+            min_net_exit_bp = float(cfg_in.get("min_net_exit_bp", MIN_NET_EXIT_BP))
+
+            # 선택 옵션
+            tp_kimp = cfg_in.get("tp_kimp")
+            sl_kimp = cfg_in.get("sl_kimp")
+            trail_bp = float(cfg_in.get("trail_bp", 0.0))
+            breakeven_shift_bp = float(cfg_in.get("breakeven_shift_bp", 0.0))
+
             bid = _new_band_id()
             bands[bid] = {
                 "id": bid, "state": "waiting",
@@ -719,7 +916,13 @@ def start():
                 "exit_on_move_bp": DEFAULT_EXIT_ON_MOVE_BP,
                 "repeat": repeat, "cooldown_sec": cooldown, "times_armed": 0,
                 "auto_size": auto_size, "max_amount_btc": max_amount_btc,
-                "entry_kimp_value": None,
+                "entry_kimp_value": None, "entry_ts": None,
+                "min_net_exit_bp": min_net_exit_bp,
+                "tp_kimp": float(tp_kimp) if tp_kimp is not None else None,
+                "sl_kimp": float(sl_kimp) if sl_kimp is not None else None,
+                "trail_bp": trail_bp,
+                "breakeven_shift_bp": breakeven_shift_bp,
+                "peak_kimp_after_entry": None,
                 "upbit": {"buy_uuid": None, "sell_uuid": None, "buy_krw": 0.0, "sell_krw": 0.0, "fee_krw": 0.0, "filled_qty": 0.0},
                 "binance": {"sell_id": None, "buy_id": None, "entry_qty": 0.0, "entry_avg": 0.0, "exit_qty": 0.0, "exit_avg": 0.0,
                             "fee_usdt": 0.0, "entry_margin_usdt": 0.0},
@@ -727,7 +930,8 @@ def start():
             }
             log(f"[밴드 추가(start)] entry={entry_k} exit={exit_k} amount={amount}BTC tol=±{tol} "
                 f"lev=x{lev} repeat={repeat} cd={cooldown} auto_size={auto_size} max_amount_btc={max_amount_btc} "
-                f"(최소요구 {REQUIRED_SPREAD_BP:.2f}%p)")
+                f"min_net_exit_bp={min_net_exit_bp} tp={bands[bid]['tp_kimp']} sl={bands[bid]['sl_kimp']} "
+                f"trail={trail_bp} be_move={breakeven_shift_bp} (최소요구 {required_spread_bp():.2f}%p)")
         running=True
         cfg = {"leverage": int(float(cfg_in.get("leverage", DEFAULT_LEVERAGE)))}
         threading.Thread(target=strategy_loop, args=(cfg,), daemon=True).start()
