@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!DOCTYPE html> 
 <html lang="ko">
 <head>
   <meta charset="UTF-8"/>
@@ -67,7 +67,7 @@
     .tab{padding:8px 12px; border-radius:10px 10px 0 0; cursor:pointer; background:#0d1729; color:#aab3c7; border:1px solid var(--border); border-bottom:none}
     .panel{display:none} .panel.active{display:block}
 
-    .log{background:#05080f; color:#cdebd7; border:1px solid #1b2a3b; padding:12px; border-radius:10px; height:360px; overflow:auto;
+    .log{background:#05080f; color:#cdebd7; border:1px solid var(--1b2a3b); padding:12px; border-radius:10px; height:360px; overflow:auto;
       font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; white-space:pre}
 
     .badge{padding:3px 8px; border-radius:999px; font-size:12px; border:1px solid var(--border); background:#0b1320}
@@ -242,14 +242,14 @@
   const loc = v => isNum(v) ? Number(v).toLocaleString() : '-';
   const floorQty = (q)=> Math.floor((Number(q)||0)/0.001)*0.001;
 
-  const UPBIT_TAKER_FEE = 0.0005; // 버퍼 제거
+  const UPBIT_TAKER_FEE = 0.0005;
 
   const DEFAULT_BANDS = [];
   const SPARK_MAX_POINTS = 180;
   let sparkData = [];
   let errCount = 0; const netBadge = $('#net-badge');
 
-  // 전역 가격(다른 함수에서 바로 참조 가능)
+  // 전역 가격
   let lastUpbit = NaN, lastBinance = NaN, lastUsdkrw = NaN;
 
   function setNetBadge(ok, ms=null){
@@ -499,10 +499,9 @@
       const sign = $('#kimp-sign');
       if (isFinite(kimp)){
         if (Math.abs(kimp) < 0.01){ sign.textContent = '중립'; sign.className = 'badge'; }
-        else{ sign.textContent = (kimp>=0 ? '프리미엄(+)' : '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
+        else{ sign.textContent = (kimp>=0 ? '프리미엄(+)': '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
       }else{ sign.textContent='-'; sign.className='badge'; }
 
-      // 최신 상태가 있으면 증거금도 재계산
       if (window.__lastStatus) updateUsedMarginFromStatus(window.__lastStatus);
 
       Array.from(document.querySelectorAll('#band-tbody tr')).forEach(updatePreviewForRow);
@@ -554,7 +553,6 @@
         tb.appendChild(tr);
       });
 
-      // 로그/메트릭/PNL
       $('#log').textContent = (s.logs||[]).join('\n');
       $('#pnl-krw-sum').textContent = (s.pnl?.profit_krw_cum ?? 0).toLocaleString();
       $('#fee-upbit-krw').textContent = (s.pnl?.fees_upbit_krw_cum ?? 0).toLocaleString();
@@ -575,7 +573,7 @@
       const N = v => { const n = Number(v); return Number.isFinite(n) ? n : NaN; };
       const krw = N(b?.real?.krw) ?? N(b?.upbit_krw) ?? N(b?.upbit?.krw) ?? N(b?.upbit?.balances?.KRW) ?? N(b?.balances?.upbit?.KRW) ?? N(b?.krw_balance);
       const btcUpbit = N(b?.real?.btc_upbit) ?? N(b?.upbit_btc) ?? N(b?.upbit?.btc) ?? N(b?.upbit?.balances?.BTC) ?? N(b?.balances?.upbit?.BTC);
-      const usdt = N(b?.real?.usdt) ?? N(b?.binance_usdt) ?? N(b?.binance?.usdt) ?? N(b?.binance?.spot?.USDT) ?? N(b?.balances?.binance?.USDT) ?? N(b?.binance?.wallets?.spot?.USDT) ?? N(b?.binance?.futures?.USDT) ?? N(b?.binance?.futures_wallet?.USDT) ?? N(b?.futures_usdt);
+      const usdt = N(b?.real?.usdt) ?? N(b?.binance_usdt) ?? N(b?.binance?.usdt) ?? N(b?.binance?.spot?.USDT) ?? N(b?.balances?.binance?.USDT) ?? N(b?.binance?.wallets?.spot?.USDT) ?? N(b?.binance?.futures?.USDT) ?? N(b?.futures_usdt);
       $('#bal-krw').textContent  = Number.isFinite(krw)     ? krw.toLocaleString() : '-';
       $('#bal-btc').textContent  = Number.isFinite(btcUpbit) ? btcUpbit.toFixed(6)  : '-';
       $('#bal-usdt').textContent = Number.isFinite(usdt)     ? usdt.toFixed(3)      : '-';
@@ -592,7 +590,7 @@
     }catch(e){ onError(e); }
   }
 
-  // ====== 실시간 김프를 위한 WebSocket 추가 (다른 로직은 변경 없음) ======
+  // ====== 실시간 김프 (WS) ======
   let upbitWS = null, binanceWS = null;
 
   function updateKimpAndUIFromTicks() {
@@ -605,7 +603,7 @@
 
     const sign = $('#kimp-sign');
     if (Math.abs(kimp) < 0.01) { sign.textContent = '중립'; sign.className = 'badge'; }
-    else { sign.textContent = (kimp>=0 ? '프리미엄(+)' : '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
+    else { sign.textContent = (kimp>=0 ? '프리미엄(+)': '디스카운트(-)'); sign.className = 'badge ' + (kimp>=0?'warn':'good'); }
 
     $('#kimp-brief').textContent = `김프 ${fx(kimp,2)}% · 업비트 ${loc(lastUpbit)} KRW · 바이낸스 ${fx(lastBinance,2)} USDT · 환율 ${fx(lastUsdkrw,2)}`;
 
@@ -613,7 +611,6 @@
     if (sparkData.length > SPARK_MAX_POINTS) sparkData.shift();
     drawSpark();
 
-    // 실시간 가격 반영 시 증거금 갱신
     if (window.__lastStatus) updateUsedMarginFromStatus(window.__lastStatus);
   }
 
@@ -636,8 +633,7 @@
           lastUpbit = p;
           updateKimpAndUIFromTicks();
         }
-      } catch(_){}
-    };
+      } catch(_){}}
     upbitWS.onclose = () => setTimeout(connectUpbitWS, 1500);
     upbitWS.onerror = () => { try { upbitWS.close(); } catch {} };
   }
@@ -653,8 +649,7 @@
           lastBinance = p;
           updateKimpAndUIFromTicks();
         }
-      } catch(_){}
-    };
+      } catch(_){}}
     binanceWS.onclose = () => setTimeout(connectBinanceWS, 1500);
     binanceWS.onerror = () => { try { binanceWS.close(); } catch {} };
   }
@@ -663,7 +658,6 @@
     connectUpbitWS();
     connectBinanceWS();
   }
-  // ===================================================
 
   // ===== Actions =====
   $('#btn-add-band').addEventListener('click', ()=>{
@@ -740,7 +734,7 @@
       try{ const j=JSON.parse(raw); renderBands(j.bands ?? DEFAULT_BANDS); }
       catch{ renderBands(DEFAULT_BANDS); }
     }else{ renderBands(DEFAULT_BANDS); }
-    startPolling();   // 기존 폴링(환율/상태/로그/백업)
+    startPolling();   // 폴링(환율/상태/로그/백업)
     startRealtime();  // 실시간 김프(업비트/바이낸스 WS)
   })();
 </script>
